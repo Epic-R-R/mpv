@@ -54,6 +54,7 @@
 #include "options/m_option.h"
 #include "options/m_property.h"
 #include "options/m_config_frontend.h"
+#include "osdep/getpid.h"
 #include "video/out/vo.h"
 #include "video/csputils.h"
 #include "video/hwdec.h"
@@ -424,6 +425,13 @@ static int mp_property_display_sync_active(void *ctx, struct m_property *prop,
 {
     MPContext *mpctx = ctx;
     return m_property_flag_ro(action, arg, mpctx->display_sync_active);
+}
+
+static int mp_property_pid(void *ctx, struct m_property *prop,
+                           int action, void *arg)
+{
+    // 32 bit on linux/windows - which C99 `int' is not guaranteed to hold
+    return m_property_int64_ro(action, arg, mp_getpid());
 }
 
 /// filename with path (RO)
@@ -2587,14 +2595,14 @@ static int mp_property_osd_dim(void *ctx, struct m_property *prop,
                     (vo_res.display_par ? vo_res.display_par : 1);
 
     struct m_sub_property props[] = {
-        {"w",       SUB_PROP_DOUBLE(vo_res.w)},
-        {"h",       SUB_PROP_DOUBLE(vo_res.h)},
+        {"w",       SUB_PROP_INT(vo_res.w)},
+        {"h",       SUB_PROP_INT(vo_res.h)},
         {"par",     SUB_PROP_DOUBLE(vo_res.display_par)},
         {"aspect",  SUB_PROP_DOUBLE(aspect)},
-        {"mt",      SUB_PROP_DOUBLE(vo_res.mt)},
-        {"mb",      SUB_PROP_DOUBLE(vo_res.mb)},
-        {"ml",      SUB_PROP_DOUBLE(vo_res.ml)},
-        {"mr",      SUB_PROP_DOUBLE(vo_res.mr)},
+        {"mt",      SUB_PROP_INT(vo_res.mt)},
+        {"mb",      SUB_PROP_INT(vo_res.mb)},
+        {"ml",      SUB_PROP_INT(vo_res.ml)},
+        {"mr",      SUB_PROP_INT(vo_res.mr)},
         {0}
     };
 
@@ -3500,6 +3508,7 @@ static int mp_property_script_props(void *ctx, struct m_property *prop,
 // Base list of properties. This does not include option-mapped properties.
 static const struct m_property mp_properties_base[] = {
     // General
+    {"pid", mp_property_pid},
     {"speed", mp_property_playback_speed},
     {"audio-speed-correction", mp_property_av_speed_correction, .priv = "a"},
     {"video-speed-correction", mp_property_av_speed_correction, .priv = "v"},

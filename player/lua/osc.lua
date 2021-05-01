@@ -101,6 +101,7 @@ local state = {
     tc_ms = user_opts.timems,               -- Should the timecodes display their time with milliseconds
     mp_screen_sizeX, mp_screen_sizeY,       -- last screen-resolution, to detect resolution changes to issue reINITs
     initREQ = false,                        -- is a re-init request pending?
+    marginsREQ = false,                     -- is a margins update pending?
     last_mouseX, last_mouseY,               -- last mouse position, to detect significant mouse movement
     mouse_in_window = false,
     message_text,
@@ -2099,7 +2100,10 @@ function update_margins()
     local margins = osc_param.video_margins
 
     -- Don't use margins if it's visible only temporarily.
-    if (not state.osc_visible) or (get_hidetimeout() >= 0) then
+    if (not state.osc_visible) or (get_hidetimeout() >= 0) or
+       (state.fullscreen and not user_opts.showfullscreen) or
+       (not state.fullscreen and not user_opts.showwindowed)
+    then
         margins = {l = 0, r = 0, t = 0, b = 0}
     end
 
@@ -2236,6 +2240,7 @@ end
 
 function render_wipe()
     msg.trace("render_wipe()")
+    state.osd.data = "" -- allows set_osd to immediately update on enable
     state.osd:remove()
 end
 
@@ -2504,6 +2509,11 @@ local santa_hat_lines = {
 
 -- called by mpv on every frame
 function tick()
+    if state.marginsREQ == true then
+        update_margins()
+        state.marginsREQ = false
+    end
+
     if (not state.enabled) then return end
 
     if (state.idle) then
@@ -2548,7 +2558,7 @@ function tick()
         render()
     else
         -- Flush OSD
-        set_osd(osc_param.playresy, osc_param.playresy, "")
+        render_wipe()
     end
 
     state.tick_last_time = mp.get_time()
@@ -2607,6 +2617,7 @@ end)
 mp.observe_property("fullscreen", "bool",
     function(name, val)
         state.fullscreen = val
+        state.marginsREQ = true
         request_init_resize()
     end
 )

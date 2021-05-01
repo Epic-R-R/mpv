@@ -46,6 +46,7 @@
 #include "player/core.h"
 #include "player/command.h"
 #include "stream/stream.h"
+#include "demux/demux.h"
 
 #if HAVE_DRM
 #include "video/out/drm_common.h"
@@ -112,7 +113,8 @@ static const m_option_t mp_vo_opt_list[] = {
     {"ontop-level", OPT_CHOICE(ontop_level, {"window", -1}, {"system", -2},
         {"desktop", -3}), M_RANGE(0, INT_MAX)},
     {"border", OPT_FLAG(border)},
-    {"fit-border", OPT_FLAG(fit_border)},
+    {"fit-border", OPT_FLAG(fit_border),
+     .deprecation_message = "the option is ignored and no longer needed"},
     {"on-all-workspaces", OPT_FLAG(all_workspaces)},
     {"geometry", OPT_GEOMETRY(geometry)},
     {"autofit", OPT_SIZE_BOX(autofit)},
@@ -514,9 +516,9 @@ static const m_option_t mp_opts[] = {
 #endif
 
     // demuxer.c - select audio/sub file/demuxer
-    {"demuxer", OPT_STRING(demuxer_name)},
-    {"audio-demuxer", OPT_STRING(audio_demuxer_name)},
-    {"sub-demuxer", OPT_STRING(sub_demuxer_name)},
+    {"demuxer", OPT_STRING(demuxer_name), .help = demuxer_help},
+    {"audio-demuxer", OPT_STRING(audio_demuxer_name), .help = demuxer_help},
+    {"sub-demuxer", OPT_STRING(sub_demuxer_name), .help = demuxer_help},
     {"demuxer-thread", OPT_FLAG(demuxer_thread)},
     {"demuxer-termination-timeout", OPT_DOUBLE(demux_termination_timeout)},
     {"demuxer-cache-wait", OPT_FLAG(demuxer_cache_wait)},

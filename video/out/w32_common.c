@@ -103,8 +103,9 @@ struct vo_w32_state {
     bool current_fs;
     bool toggle_fs; // whether the current fullscreen state needs to be switched
 
-    RECT windowrc; // currently known window rect
-    RECT prev_windowrc; // last non-fullscreen window rect
+    // Note: maximized state doesn't involve nor modify windowrc
+    RECT windowrc; // currently known normal/fullscreen window client rect
+    RECT prev_windowrc; // saved normal window client rect while in fullscreen
 
     // video size
     uint32_t o_dwidth;
@@ -129,7 +130,13 @@ struct vo_w32_state {
     // UTF-16 decoding state for WM_CHAR and VK_PACKET
     int high_surrogate;
 
-    // Whether to fit the window on screen on next window state updating
+    // Fit the window to one monitor working area next time it's not fullscreen
+    // and not maximized. Used once after every new "untrusted" size comes from
+    // mpv, else we assume that the last known size is valid and don't fit.
+    // FIXME: on a multi-monitor setup one bit is not enough, because the first
+    // fit (autofit etc) should be to one monitor, but later size changes from
+    // mpv like window-scale (VOCTRL_SET_UNFS_WINDOW_SIZE) should allow the
+    // entire virtual desktop area - but we still limit to one monitor size.
     bool fit_on_screen;
 
     ITaskbarList2 *taskbar_list;
@@ -795,13 +802,12 @@ static void update_window_style(struct vo_w32_state *w32)
     w32->windowrc = wr;
 }
 
-// Adjust rc size and position if its size is larger than rc2.
+// If rc is wider/taller than n_w/n_h, shrink rc size while keeping the center.
 // returns true if the rectangle was modified.
-static bool fit_rect(RECT *rc, RECT *rc2)
+static bool fit_rect_size(RECT *rc, long n_w, long n_h)
 {
-    // Calculate old size and maximum new size
+    // nothing to do if we already fit.
     int o_w = rect_w(*rc), o_h = rect_h(*rc);
-    int n_w = rect_w(*rc2), n_h = rect_h(*rc2);
     if (o_w <= n_w && o_h <= n_h)
         return false;
 
@@ -821,17 +827,27 @@ static bool fit_rect(RECT *rc, RECT *rc2)
     return true;
 }
 
-// Adjust window size and position if its size is larger than the screen size.
+// If the window is bigger than the desktop, shrink to fit with same center.
+// Also, if the top edge is above the working area, move down to align.
 static void fit_window_on_screen(struct vo_w32_state *w32)
 {
-    if (w32->parent || w32->current_fs || IsMaximized(w32->window))
-        return;
-
     RECT screen = get_working_area(w32);
-    if (w32->opts->border && w32->opts->fit_border)
+    if (w32->opts->border)
         subtract_window_borders(w32, w32->window, &screen);
 
-    if (fit_rect(&w32->windowrc, &screen)) {
+    bool adjusted = fit_rect_size(&w32->windowrc, rect_w(screen), rect_h(screen));
+
+    if (w32->windowrc.top < screen.top) {
+        // if the top-edge of client area is above the target area (mainly
+        // because the client-area is centered but the title bar is taller
+        // than the bottom border), then move it down to align the edges.
+        // Windows itself applies the same constraint during manual move.
+        w32->windowrc.bottom += screen.top - w32->windowrc.top;
+        w32->windowrc.top = screen.top;
+        adjusted = true;
+    }
+
+    if (adjusted) {
         MP_VERBOSE(w32, "adjusted window bounds: %d:%d:%d:%d\n",
                    (int)w32->windowrc.left, (int)w32->windowrc.top,
                    (int)rect_w(w32->windowrc), (int)rect_h(w32->windowrc));
@@ -839,11 +855,10 @@ static void fit_window_on_screen(struct vo_w32_state *w32)
 }
 
 // Calculate new fullscreen state and change window size and position.
-// returns true if fullscreen state was changed.
-static bool update_fullscreen_state(struct vo_w32_state *w32)
+static void update_fullscreen_state(struct vo_w32_state *w32)
 {
     if (w32->parent)
-        return false;
+        return;
 
     bool new_fs = w32->opts->fullscreen;
     if (w32->toggle_fs) {
@@ -875,7 +890,6 @@ static bool update_fullscreen_state(struct vo_w32_state *w32)
     MP_VERBOSE(w32, "reset window bounds: %d:%d:%d:%d\n",
                (int)w32->windowrc.left, (int)w32->windowrc.top,
                (int)rect_w(w32->windowrc), (int)rect_h(w32->windowrc));
-    return toggle_fs;
 }
 
 static void update_minimized_state(struct vo_w32_state *w32)
@@ -969,15 +983,13 @@ static void reinit_window_state(struct vo_w32_state *w32)
         return;
 
     // The order matters: fs state should be updated prior to changing styles
-    bool toggle_fs = update_fullscreen_state(w32);
+    update_fullscreen_state(w32);
     update_window_style(w32);
 
-    // Assume that the window has already been fit on screen before switching fs
-    if (!toggle_fs || w32->fit_on_screen) {
+    // fit_on_screen is applied at most once when/if applicable (normal win).
+    if (w32->fit_on_screen && !w32->current_fs && !IsMaximized(w32->window)) {
         fit_window_on_screen(w32);
-        // The fullscreen state might still be active, so set the flag
-        // to fit on screen next time the window leaves the fullscreen.
-        w32->fit_on_screen = w32->current_fs;
+        w32->fit_on_screen = false;
     }
 
     // Show and activate the window after all window state parameters were set

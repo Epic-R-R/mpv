@@ -136,7 +136,7 @@ static int parse_slice_range(stream_t *stream)
     return STREAM_OK;
 }
 
-static int open2(struct stream *stream, struct stream_open_args *args)
+static int open2(struct stream *stream, const struct stream_open_args *args)
 {
     struct priv *p = talloc_zero(stream, struct priv);
     stream->priv = p;
@@ -151,8 +151,9 @@ static int open2(struct stream *stream, struct stream_open_args *args)
         return parse_ret;
     }
 
-    args->url = stream->path;
-    int inner_ret = stream_create_with_args(args, &p->inner);
+    struct stream_open_args args2 = *args;
+    args2.url = stream->path;
+    int inner_ret = stream_create_with_args(&args2, &p->inner);
     if (inner_ret != STREAM_OK) {
         return inner_ret;
     }

@@ -176,7 +176,7 @@ static bool check_stream_network(int fd)
 {
     struct statfs fs;
     const char *stypes[] = { "afpfs", "nfs", "smbfs", "webdav", "osxfusefs",
-                             "fuse", "fusefs.sshfs", NULL };
+                             "fuse", "fusefs.sshfs", "macfuse", NULL };
     if (fstatfs(fd, &fs) == 0)
         for (int i=0; stypes[i]; i++)
             if (strcmp(stypes[i], fs.f_fstypename) == 0)
@@ -246,7 +246,7 @@ static bool check_stream_network(int fd)
 }
 #endif
 
-static int open_f(stream_t *stream, struct stream_open_args *args)
+static int open_f(stream_t *stream, const struct stream_open_args *args)
 {
     struct priv *p = talloc_ptrtype(stream, p);
     *p = (struct priv) {
