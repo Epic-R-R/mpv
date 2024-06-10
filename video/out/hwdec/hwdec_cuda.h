@@ -29,9 +29,6 @@ struct cuda_hw_priv {
     CUcontext display_ctx;
     CUcontext decode_ctx;
 
-    // Stored as int to avoid depending on libplacebo enum
-    int handle_type;
-
     // Do we need to do a full CPU sync after copying
     bool do_full_sync;
 
@@ -53,10 +50,13 @@ struct cuda_mapper_priv {
     void *ext[4];
 };
 
-typedef bool (*cuda_interop_init)(const struct ra_hwdec *hw);
+struct cuda_interop_fn {
+    bool (*check)(const struct ra_hwdec *hw);
+    bool (*init)(const struct ra_hwdec *hw);
+};
 
-bool cuda_gl_init(const struct ra_hwdec *hw);
+extern struct cuda_interop_fn cuda_gl_fn;
 
-bool cuda_vk_init(const struct ra_hwdec *hw);
+extern struct cuda_interop_fn cuda_vk_fn;
 
 int check_cu(const struct ra_hwdec *hw, CUresult err, const char *func);

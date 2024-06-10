@@ -30,7 +30,7 @@ struct f_opts {
     int out_srate;
     struct m_channels out_channels;
 
-    int fail;
+    bool fail;
 };
 
 struct priv {
@@ -38,7 +38,7 @@ struct priv {
     struct mp_pin *in_pin;
 };
 
-static void process(struct mp_filter *f)
+static void af_format_process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
@@ -85,7 +85,7 @@ error:
 static const struct mp_filter_info af_format_filter = {
     .name = "format",
     .priv_size = sizeof(struct priv),
-    .process = process,
+    .process = af_format_process,
 };
 
 static struct mp_filter *af_format_create(struct mp_filter *parent,
@@ -135,7 +135,7 @@ const struct mp_user_filter_entry af_format = {
             {"out-srate", OPT_INT(out_srate), M_RANGE(1000, 8*48000)},
             {"out-channels", OPT_CHANNELS(out_channels),
                 .flags = M_OPT_CHANNELS_LIMITED},
-            {"fail", OPT_FLAG(fail)},
+            {"fail", OPT_BOOL(fail)},
             {0}
         },
     },

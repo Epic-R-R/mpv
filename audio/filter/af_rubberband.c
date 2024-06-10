@@ -20,6 +20,8 @@
 
 #include <rubberband/rubberband-c.h>
 
+#include "config.h"
+
 #include "audio/aframe.h"
 #include "audio/format.h"
 #include "common/common.h"
@@ -31,7 +33,7 @@
 // command line options
 struct f_opts {
     int transients, detector, phase, window,
-        smoothing, formant, pitch, channels;
+        smoothing, formant, pitch, channels, engine;
     double scale;
 };
 
@@ -78,7 +80,10 @@ static bool init_rubberband(struct mp_filter *f)
 
     int opts = p->opts->transients | p->opts->detector | p->opts->phase |
                p->opts->window | p->opts->smoothing | p->opts->formant |
-               p->opts->pitch | p-> opts->channels |
+               p->opts->pitch | p->opts->channels |
+#if HAVE_RUBBERBAND_3
+               p->opts->engine |
+#endif
                RubberBandOptionProcessRealTime;
 
     int rate = mp_aframe_get_rate(p->pending);
@@ -100,7 +105,7 @@ static bool init_rubberband(struct mp_filter *f)
     return true;
 }
 
-static void process(struct mp_filter *f)
+static void af_rubberband_process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
@@ -228,7 +233,7 @@ error:
     mp_filter_internal_mark_failed(f);
 }
 
-static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
+static bool af_rubberband_command(struct mp_filter *f, struct mp_filter_command *cmd)
 {
     struct priv *p = f->priv;
 
@@ -258,7 +263,7 @@ static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
     return false;
 }
 
-static void reset(struct mp_filter *f)
+static void af_rubberband_reset(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
@@ -269,7 +274,7 @@ static void reset(struct mp_filter *f)
     TA_FREEP(&p->pending);
 }
 
-static void destroy(struct mp_filter *f)
+static void af_rubberband_destroy(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
@@ -281,10 +286,10 @@ static void destroy(struct mp_filter *f)
 static const struct mp_filter_info af_rubberband_filter = {
     .name = "rubberband",
     .priv_size = sizeof(struct priv),
-    .process = process,
-    .command = command,
-    .reset = reset,
-    .destroy = destroy,
+    .process = af_rubberband_process,
+    .command = af_rubberband_command,
+    .reset = af_rubberband_reset,
+    .destroy = af_rubberband_destroy,
 };
 
 static struct mp_filter *af_rubberband_create(struct mp_filter *parent,
@@ -331,6 +336,9 @@ const struct mp_user_filter_entry af_rubberband = {
             .transients = RubberBandOptionTransientsMixed,
             .formant = RubberBandOptionFormantPreserved,
             .channels = RubberBandOptionChannelsTogether,
+#if HAVE_RUBBERBAND_3
+            .engine = RubberBandOptionEngineFiner,
+#endif
         },
         .options = (const struct m_option[]) {
             {"transients", OPT_CHOICE(transients,
@@ -361,6 +369,11 @@ const struct mp_user_filter_entry af_rubberband = {
             {"channels", OPT_CHOICE(channels,
                 {"apart", RubberBandOptionChannelsApart},
                 {"together", RubberBandOptionChannelsTogether})},
+#if HAVE_RUBBERBAND_3
+            {"engine", OPT_CHOICE(engine,
+                {"finer", RubberBandOptionEngineFiner},
+                {"faster", RubberBandOptionEngineFaster})},
+#endif
             {"pitch-scale", OPT_DOUBLE(scale), M_RANGE(0.01, 100)},
             {0}
         },

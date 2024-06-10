@@ -43,7 +43,8 @@ pl next
     =============   ================================================
 
 title
-    | Displays current media-title, filename, or custom title
+    | Displays current media-title, filename, custom title, or target chapter
+      name while hovering the seekbar.
 
     =============   ================================================
     left-click      show playlist position and length and full title
@@ -84,6 +85,7 @@ seekbar
 
     =============   ================================================
     left-click      seek to position
+    mouse wheel     seek forward/backward
     =============   ================================================
 
 time left
@@ -100,6 +102,7 @@ audio and sub
     left-click      cycle audio/sub tracks forward
     right-click     cycle audio/sub tracks backwards
     shift+L-click   show available audio/sub tracks
+    mouse wheel     cycle audio/sub tracks forward/backwards
     =============   ================================================
 
 vol
@@ -127,22 +130,9 @@ del             Cycles visibility between never / auto (mouse-move) / always
 Configuration
 -------------
 
-The OSC offers limited configuration through a config file
-``script-opts/osc.conf`` placed in mpv's user dir and through the
-``--script-opts`` command-line option. Options provided through the command-line
-will override those from the config file.
-
-Config Syntax
-~~~~~~~~~~~~~
-
-The config file must exactly follow the following syntax::
-
-    # this is a comment
-    optionA=value1
-    optionB=value2
-
-``#`` can only be used at the beginning of a line and there may be no
-spaces around the ``=`` or anywhere else.
+This script can be customized through a config file ``script-opts/osc.conf``
+placed in mpv's user directory and through the ``--script-opts`` command-line
+option. The configuration syntax is described in `mp.options functions`_.
 
 Command-line Syntax
 ~~~~~~~~~~~~~~~~~~~
@@ -173,18 +163,18 @@ Configurable Options
 ``seekbarhandlesize``
     Default: 0.6
 
-    Size ratio of the seek handle if ``seekbarstyle`` is set to ``dimaond``
+    Size ratio of the seek handle if ``seekbarstyle`` is set to ``diamond``
     or ``knob``. This is relative to the full height of the seekbar.
 
 ``seekbarkeyframes``
     Default: yes
 
-    Controls the mode used to seek when dragging the seekbar (default: true). If
-    set to true, default seeking mode is used (usually keyframes, but player
-    defaults and heuristics can change it to exact). If set to false, exact
-    seeking on mouse drags will be used instead. Keyframes are preferred, but
-    exact seeks may be useful in cases where keyframes cannot be found. Note
-    that using exact seeks can potentially make mouse dragging much slower.
+    Controls the mode used to seek when dragging the seekbar. If set to ``yes``,
+    default seeking mode is used (usually keyframes, but player defaults and
+    heuristics can change it to exact). If set to ``no``, exact seeking on
+    mouse drags will be used instead. Keyframes are preferred, but exact seeks
+    may be useful in cases where keyframes cannot be found. Note that using
+    exact seeks can potentially make mouse dragging much slower.
 
 ``seekrangestyle``
     Default: inverted
@@ -207,6 +197,13 @@ Configurable Options
     Default: 200
 
     Alpha of the seekable ranges, 0 (opaque) to 255 (fully transparent).
+
+``scrollcontrols``
+    Default: yes
+
+    By default, going up or down with the mouse wheel can trigger certain
+    actions (such as seeking) if the mouse is hovering an OSC element.
+    Set to ``no`` to disable any special mouse wheel behavior.
 
 ``deadzonesize``
     Default: 0.5
@@ -235,6 +232,11 @@ Configurable Options
 
     Enable the OSC when fullscreen
 
+``idlescreen``
+    Default: yes
+
+    Show the mpv logo and message when idle
+
 ``scalewindowed``
     Default: 1.0
 
@@ -245,16 +247,13 @@ Configurable Options
 
     Scale factor of the OSC when fullscreen
 
-``scaleforcedwindow``
-    Default: 2.0
-
-    Scale factor of the OSC when rendered on a forced (dummy) window
-
 ``vidscale``
-    Default: yes
+    Default: auto
 
-    Scale the OSC with the video
-    ``no`` tries to keep the OSC size constant as much as the window size allows
+    Scale the OSC with the video.
+    ``no`` tries to keep the OSC size constant as much as the window size allows.
+    ``auto`` scales the OSC with the OSD, which is scaled with the window or kept at a
+    constant size, depending on the ``--osd-scale-by-window`` option.
 
 ``valign``
     Default: 0.8
@@ -292,7 +291,7 @@ Configurable Options
 
     String that supports property expansion that will be displayed as
     OSC title.
-    ASS tags are escaped, and newlines and trailing slashes are stripped.
+    ASS tags are escaped and newlines are converted to spaces.
 
 ``tooltipborder``
     Default: 1
@@ -304,10 +303,25 @@ Configurable Options
 
     Show total time instead of time remaining
 
+``remaining_playtime``
+    Default: yes
+
+    Whether the time-remaining display takes speed into account.
+    ``yes`` - how much playback time remains at the current speed.
+    ``no`` - how much video-time remains.
+
 ``timems``
     Default: no
 
     Display timecodes with milliseconds
+
+``tcspace``
+    Default: 100 (allowed: 50-200)
+
+    Adjust space reserved for timecodes (current time and time remaining) in
+    the ``bottombar`` and ``topbar`` layouts. The timecode width depends on the
+    font, and with some fonts the spacing near the timecodes becomes too small.
+    Use values above 100 to increase that spacing, or below 100 to decrease it.
 
 ``visibility``
     Default: auto (auto hide/show on mouse move)
@@ -370,10 +384,108 @@ Configurable Options
     Supports ``left`` and ``right`` which will place the controls on those
     respective sides.
 
+``windowcontrols_title``
+    Default: ${media-title}
+
+    String that supports property expansion that will be displayed as the
+    windowcontrols title.
+    ASS tags are escaped, and newlines and trailing slashes are stripped.
+
 ``greenandgrumpy``
     Default: no
 
     Set to ``yes`` to reduce festivity (i.e. disable santa hat in December.)
+
+``livemarkers``
+    Default: yes
+
+    Update chapter markers positions on duration changes, e.g. live streams.
+    The updates are unoptimized - consider disabling it on very low-end systems.
+
+``chapters_osd``, ``playlist_osd``
+    Default: yes
+
+    Whether to display the chapters/playlist at the OSD when left-clicking the
+    next/previous OSC buttons, respectively.
+
+``chapter_fmt``
+    Default: ``Chapter: %s``
+
+    Template for the chapter-name display when hovering the seekbar.
+    Use ``no`` to disable chapter display on hover. Otherwise it's a lua
+    ``string.format`` template and ``%s`` is replaced with the actual name.
+
+``unicodeminus``
+    Default: no
+
+    Use a Unicode minus sign instead of an ASCII hyphen when displaying
+    the remaining playback time.
+
+``background_color``
+    Default: #000000
+
+    Sets the background color of the OSC.
+
+``timecode_color``
+    Default: #FFFFFF
+
+    Sets the color of the timecode and seekbar, of the OSC.
+
+``title_color``
+    Default: #FFFFFF
+
+    Sets the color of the video title. Formatted as #RRGGBB.
+
+``time_pos_color``
+    Default: #FFFFFF
+
+    Sets the color of the timecode at hover position in the seekbar.
+
+``time_pos_outline_color``
+    Default: #FFFFFF
+
+    Sets the color of the timecode's outline at hover position in the seekbar.
+    Also affects the timecode in the slimbox layout.
+
+``buttons_color``
+    Default: #FFFFFF
+
+    Sets the colors of the big buttons.
+
+``top_buttons_color``
+    Default: #FFFFFF
+
+    Sets the colors of the top buttons.
+
+``small_buttonsL_color``
+    Default: #FFFFFF
+
+    Sets the colors of the small buttons on the left in the box layout.
+
+``small_buttonsR_color``
+    Default: #FFFFFF
+
+    Sets the colors of the small buttons on the right in the box layout.
+
+``held_element_color``
+    Default: #999999
+
+    Sets the colors of the elements that are being pressed or held down.
+
+``tick_delay``
+    Default: 1/60
+
+    Sets the minimum interval between OSC redraws in seconds. This can be
+    decreased on fast systems to make OSC rendering smoother.
+
+    Ignored if ``tick_delay_follow_display_fps`` is set to yes and the VO
+    supports the ``display-fps`` property.
+
+``tick_delay_follow_display_fps``
+    Default: no
+
+    Use display fps to calculate the interval between OSC redraws.
+
 
 Script Commands
 ~~~~~~~~~~~~~~~
@@ -396,6 +508,10 @@ to set auto mode (the default) with ``b``::
 
     a script-message osc-visibility never
     b script-message osc-visibility auto
+
+``osc-idlescreen``
+    Controls the visibility of the mpv logo on idle. Valid arguments are ``yes``,
+    ``no``, and ``cycle`` to toggle between yes and no.
 
 ``osc-playlist``, ``osc-chapterlist``, ``osc-tracklist``
     Shows a limited view of the respective type of list using the OSC. First

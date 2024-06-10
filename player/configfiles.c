@@ -21,12 +21,15 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
 #include <utime.h>
+#endif
 
 #include <libavutil/md5.h>
 
-#include "config.h"
 #include "mpv_talloc.h"
 
 #include "osdep/io.h"
@@ -37,6 +40,7 @@
 #include "misc/ctype.h"
 #include "options/path.h"
 #include "options/m_config.h"
+#include "options/m_config_frontend.h"
 #include "options/parse_configfile.h"
 #include "common/playlist.h"
 #include "options/options.h"
@@ -52,7 +56,7 @@ static void load_all_cfgfiles(struct MPContext *mpctx, char *section,
 {
     char **cf = mp_find_all_config_files(NULL, mpctx->global, filename);
     for (int i = 0; cf && cf[i]; i++)
-        m_config_parse_config_file(mpctx->mconfig, cf[i], section, 0);
+        m_config_parse_config_file(mpctx->mconfig, mpctx->global, cf[i], section, 0);
     talloc_free(cf);
 }
 
@@ -63,7 +67,7 @@ void mp_parse_cfgfiles(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
 
-    mp_mk_config_dir(mpctx->global, "");
+    mp_mk_user_dir(mpctx->global, "home", "");
 
     char *p1 = mp_get_user_path(NULL, mpctx->global, "~~home/");
     char *p2 = mp_get_user_path(NULL, mpctx->global, "~~old_home/");
@@ -99,7 +103,7 @@ static int try_load_config(struct MPContext *mpctx, const char *file, int flags,
     if (!mp_path_exists(file))
         return 0;
     MP_MSG(mpctx, msgl, "Loading config '%s'\n", file);
-    m_config_parse_config_file(mpctx->mconfig, file, NULL, flags);
+    m_config_parse_config_file(mpctx->mconfig, mpctx->global, file, NULL, flags);
     return 1;
 }
 
@@ -192,106 +196,44 @@ static bool copy_mtime(const char *f1, const char *f2)
     return true;
 }
 
+static char *mp_get_playback_resume_dir(struct MPContext *mpctx)
+{
+    char *wl_dir = mpctx->opts->watch_later_dir;
+    if (wl_dir && wl_dir[0]) {
+        wl_dir = mp_get_user_path(mpctx, mpctx->global, wl_dir);
+    } else {
+        wl_dir = mp_find_user_file(mpctx, mpctx->global, "state", MP_WATCH_LATER_CONF);
+    }
+    return wl_dir;
+}
+
 static char *mp_get_playback_resume_config_filename(struct MPContext *mpctx,
                                                     const char *fname)
 {
     struct MPOpts *opts = mpctx->opts;
     char *res = NULL;
     void *tmp = talloc_new(NULL);
-    const char *realpath = fname;
-    bstr bfname = bstr0(fname);
-    if (!mp_is_url(bfname)) {
-        if (opts->ignore_path_in_watch_later_config) {
-            realpath = mp_basename(fname);
-        } else {
-            char *cwd = mp_getcwd(tmp);
-            if (!cwd)
-                goto exit;
-            realpath = mp_path_join(tmp, cwd, fname);
-        }
+    const char *path = NULL;
+    if (opts->ignore_path_in_watch_later_config && !mp_is_url(bstr0(path))) {
+        path = mp_basename(fname);
+    } else {
+        path = mp_normalize_path(tmp, fname);
+        if (!path)
+            goto exit;
     }
     uint8_t md5[16];
-    av_md5_sum(md5, realpath, strlen(realpath));
+    av_md5_sum(md5, path, strlen(path));
     char *conf = talloc_strdup(tmp, "");
     for (int i = 0; i < 16; i++)
         conf = talloc_asprintf_append(conf, "%02X", md5[i]);
 
-    if (!mpctx->cached_watch_later_configdir) {
-        char *wl_dir = mpctx->opts->watch_later_directory;
-        if (wl_dir && wl_dir[0]) {
-            mpctx->cached_watch_later_configdir =
-                mp_get_user_path(mpctx, mpctx->global, wl_dir);
-        }
-    }
-
-    if (!mpctx->cached_watch_later_configdir) {
-        mpctx->cached_watch_later_configdir =
-            mp_find_user_config_file(mpctx, mpctx->global, MP_WATCH_LATER_CONF);
-    }
-
-    if (mpctx->cached_watch_later_configdir)
-        res = mp_path_join(NULL, mpctx->cached_watch_later_configdir, conf);
+    char *wl_dir = mp_get_playback_resume_dir(mpctx);
+    if (wl_dir && wl_dir[0])
+        res = mp_path_join(NULL, wl_dir, conf);
 
 exit:
     talloc_free(tmp);
     return res;
-}
-
-static const char *const backup_properties[] = {
-    "osd-level",
-    //"loop",
-    "speed",
-    "options/edition",
-    "pause",
-    "volume",
-    "mute",
-    "audio-delay",
-    //"balance",
-    "fullscreen",
-    "ontop",
-    "border",
-    "gamma",
-    "brightness",
-    "contrast",
-    "saturation",
-    "hue",
-    "options/deinterlace",
-    "vf",
-    "af",
-    "panscan",
-    "options/aid",
-    "options/vid",
-    "options/sid",
-    "sub-delay",
-    "sub-speed",
-    "sub-pos",
-    "sub-visibility",
-    "sub-scale",
-    "sub-use-margins",
-    "sub-ass-force-margins",
-    "sub-ass-vsfilter-aspect-compat",
-    "sub-style-override",
-    "ab-loop-a",
-    "ab-loop-b",
-    "options/video-aspect-override",
-    0
-};
-
-// Used to retrieve default settings, which should not be stored in the
-// resume config. Uses backup_properties[] meaning/order of values.
-// This explicitly includes values set by config files and command line.
-void mp_get_resume_defaults(struct MPContext *mpctx)
-{
-    char **list =
-        talloc_zero_array(mpctx, char*, MP_ARRAY_SIZE(backup_properties));
-    for (int i = 0; backup_properties[i]; i++) {
-        const char *pname = backup_properties[i];
-        char *val = NULL;
-        int r = mp_property_do(pname, M_PROPERTY_GET_STRING, &val, mpctx);
-        if (r == M_PROPERTY_OK)
-            list[i] = talloc_steal(list, val);
-    }
-    mpctx->resume_defaults = list;
 }
 
 // Should follow what parser-cfg.c does/needs
@@ -309,6 +251,9 @@ static bool needs_config_quoting(const char *s)
 
 static void write_filename(struct MPContext *mpctx, FILE *file, char *filename)
 {
+    if (mpctx->opts->ignore_path_in_watch_later_config && !mp_is_url(bstr0(filename)))
+        filename = mp_basename(filename);
+
     if (mpctx->opts->write_filename_in_watch_later_config) {
         char write_name[1024] = {0};
         for (int n = 0; filename[n] && n < sizeof(write_name) - 1; n++)
@@ -336,131 +281,160 @@ static void write_redirect(struct MPContext *mpctx, char *path)
     }
 }
 
+static void write_redirects_for_parent_dirs(struct MPContext *mpctx, char *path)
+{
+    if (mp_is_url(bstr0(path)) || mpctx->opts->ignore_path_in_watch_later_config)
+        return;
+
+    // Write redirect entries for the file's parent directories to allow
+    // resuming playback when playing parent directories whose entries are
+    // expanded only the first time they are "played". For example, if
+    // "/a/b/c.mkv" is the current entry, also create resume files for /a/b and
+    // /a, so that "mpv --directory-mode=lazy /a" resumes playback from
+    // /a/b/c.mkv even when b isn't the first directory in /a.
+    bstr dir = mp_dirname(path);
+    // There is no need to write a redirect entry for "/".
+    while (dir.len > 1 && dir.len < strlen(path)) {
+        path[dir.len] = '\0';
+        mp_path_strip_trailing_separator(path);
+        write_redirect(mpctx, path);
+        dir = mp_dirname(path);
+    }
+}
+
 void mp_write_watch_later_conf(struct MPContext *mpctx)
 {
     struct playlist_entry *cur = mpctx->playing;
     char *conffile = NULL;
+    void *ctx = talloc_new(NULL);
+
     if (!cur)
+        goto exit;
+
+    char *path = mp_normalize_path(ctx, cur->filename);
+    if (!path)
         goto exit;
 
     struct demuxer *demux = mpctx->demuxer;
 
-    conffile = mp_get_playback_resume_config_filename(mpctx, cur->filename);
+    conffile = mp_get_playback_resume_config_filename(mpctx, path);
     if (!conffile)
         goto exit;
 
-    mp_mk_config_dir(mpctx->global, mpctx->cached_watch_later_configdir);
+    char *wl_dir = mp_get_playback_resume_dir(mpctx);
+    mp_mkdirp(wl_dir);
 
     MP_INFO(mpctx, "Saving state.\n");
 
     FILE *file = fopen(conffile, "wb");
-    if (!file)
+    if (!file) {
+        MP_WARN(mpctx, "Can't open %s for writing\n", conffile);
         goto exit;
+    }
 
-    write_filename(mpctx, file, cur->filename);
+    write_filename(mpctx, file, path);
 
-    double pos = get_current_time(mpctx);
+    bool write_start = true;
+    double pos = get_playback_time(mpctx);
 
     if ((demux && (!demux->seekable || demux->partially_seekable)) ||
         pos == MP_NOPTS_VALUE)
     {
+        write_start = false;
         MP_INFO(mpctx, "Not seekable, or time unknown - not saving position.\n");
-    } else {
-        fprintf(file, "start=%f\n", pos);
     }
-    for (int i = 0; backup_properties[i]; i++) {
-        const char *pname = backup_properties[i];
-        char *val = NULL;
-        int r = mp_property_do(pname, M_PROPERTY_GET_STRING, &val, mpctx);
-        if (r == M_PROPERTY_OK) {
-            if (strncmp(pname, "options/", 8) == 0)
-                pname += 8;
-            // Only store it if it's different from the initial value.
-            char *prev = mpctx->resume_defaults[i];
-            if (!prev || strcmp(prev, val) != 0) {
-                if (needs_config_quoting(val)) {
-                    // e.g. '%6%STRING'
-                    fprintf(file, "%s=%%%d%%%s\n", pname, (int)strlen(val), val);
-                } else {
-                    fprintf(file, "%s=%s\n", pname, val);
-                }
-            }
+    char **watch_later_options = mpctx->opts->watch_later_options;
+    for (int i = 0; watch_later_options && watch_later_options[i]; i++) {
+        char *pname = watch_later_options[i];
+        // Always save start if we have it in the array.
+        if (write_start && strcmp(pname, "start") == 0) {
+            fprintf(file, "%s=%f\n", pname, pos);
+            continue;
         }
-        talloc_free(val);
+        // Only store it if it's different from the initial value.
+        if (m_config_watch_later_backup_opt_changed(mpctx->mconfig, pname)) {
+            char *val = NULL;
+            mp_property_do(pname, M_PROPERTY_GET_STRING, &val, mpctx);
+            if (needs_config_quoting(val)) {
+                // e.g. '%6%STRING'
+                fprintf(file, "%s=%%%d%%%s\n", pname, (int)strlen(val), val);
+            } else {
+                fprintf(file, "%s=%s\n", pname, val);
+            }
+            talloc_free(val);
+        }
     }
     fclose(file);
 
-    if (mpctx->opts->position_check_mtime &&
-        !mp_is_url(bstr0(cur->filename)) &&
-        !copy_mtime(cur->filename, conffile))
+    if (mpctx->opts->position_check_mtime && !mp_is_url(bstr0(path)) &&
+        !copy_mtime(path, conffile))
     {
         MP_WARN(mpctx, "Can't copy mtime from %s to %s\n", cur->filename,
                 conffile);
     }
 
-    // This allows us to recursively resume directories etc., whose entries are
-    // expanded the first time it's "played". For example, if "/a/b/c.mkv" is
-    // the current entry, then we want to resume this file if the user does
-    // "mpv /a". This would expand to the directory entries in "/a", and if
-    // "/a/a.mkv" is not the first entry, this would be played.
-    // Here, we write resume entries for "/a" and "/a/b".
-    // (Unfortunately, this will leave stray resume files on resume, because
-    // obviously it resumes only from one of those paths.)
-    for (int n = 0; n < cur->num_redirects; n++)
-        write_redirect(mpctx, cur->redirects[n]);
-    // And at last, for local directories, we write an entry for each path
-    // prefix, so the user can resume from an arbitrary directory. This starts
-    // with the first redirect (all other redirects are further prefixes).
-    if (cur->num_redirects) {
-        char *path = cur->redirects[0];
-        char tmp[4096];
-        if (!mp_is_url(bstr0(path)) && strlen(path) < sizeof(tmp)) {
-            snprintf(tmp, sizeof(tmp), "%s", path);
-            for (;;) {
-                bstr dir = mp_dirname(tmp);
-                if (dir.len == strlen(tmp) || !dir.len || bstr_equals0(dir, "."))
-                    break;
+    write_redirects_for_parent_dirs(mpctx, path);
 
-                tmp[dir.len] = '\0';
-                if (strlen(tmp) >= 2) // keep "/"
-                    mp_path_strip_trailing_separator(tmp);
-                write_redirect(mpctx, tmp);
-            }
-        }
+    // Also write redirect entries for a playlist that mpv expanded if the
+    // current entry is a URL, this is mostly useful for playing multiple
+    // archives of images, e.g. with mpv 1.zip 2.zip and quit-watch-later
+    // on 2.zip, write redirect entries for 2.zip, not just for the archive://
+    // URL.
+    if (cur->playlist_path && mp_is_url(bstr0(path))) {
+        char *playlist_path = mp_normalize_path(ctx, cur->playlist_path);
+        write_redirect(mpctx, playlist_path);
+        write_redirects_for_parent_dirs(mpctx, playlist_path);
     }
 
 exit:
     talloc_free(conffile);
+    talloc_free(ctx);
 }
 
 void mp_delete_watch_later_conf(struct MPContext *mpctx, const char *file)
 {
-    if (!file) {
-        struct playlist_entry *cur = mpctx->playing;
-        if (!cur)
-            return;
-        file = cur->filename;
-        if (!file)
-            return;
+    void *ctx = talloc_new(NULL);
+    char *path = mp_normalize_path(ctx, file ? file : mpctx->filename);
+    if (!path)
+        goto exit;
+
+    char *fname = mp_get_playback_resume_config_filename(mpctx, path);
+    if (fname) {
+        unlink(fname);
+        talloc_free(fname);
     }
 
-    char *fname = mp_get_playback_resume_config_filename(mpctx, file);
-    if (fname)
-        unlink(fname);
-    talloc_free(fname);
+    if (mp_is_url(bstr0(path)) || mpctx->opts->ignore_path_in_watch_later_config)
+        goto exit;
+
+    bstr dir = mp_dirname(path);
+    while (dir.len > 1 && dir.len < strlen(path)) {
+        path[dir.len] = '\0';
+        mp_path_strip_trailing_separator(path);
+        fname = mp_get_playback_resume_config_filename(mpctx, path);
+        if (fname) {
+            unlink(fname);
+            talloc_free(fname);
+        }
+        dir = mp_dirname(path);
+    }
+
+exit:
+    talloc_free(ctx);
 }
 
-void mp_load_playback_resume(struct MPContext *mpctx, const char *file)
+bool mp_load_playback_resume(struct MPContext *mpctx, const char *file)
 {
+    bool resume = false;
     if (!mpctx->opts->position_resume)
-        return;
+        return resume;
     char *fname = mp_get_playback_resume_config_filename(mpctx, file);
     if (fname && mp_path_exists(fname)) {
         if (mpctx->opts->position_check_mtime &&
             !mp_is_url(bstr0(file)) && !check_mtime(file, fname))
         {
             talloc_free(fname);
-            return;
+            return resume;
         }
 
         // Never apply the saved start position to following files
@@ -468,9 +442,10 @@ void mp_load_playback_resume(struct MPContext *mpctx, const char *file)
         MP_INFO(mpctx, "Resuming playback. This behavior can "
                "be disabled with --no-resume-playback.\n");
         try_load_config(mpctx, fname, M_SETOPT_PRESERVE_CMDLINE, MSGL_V);
-        unlink(fname);
+        resume = true;
     }
     talloc_free(fname);
+    return resume;
 }
 
 // Returns the first file that has a resume config.

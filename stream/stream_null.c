@@ -17,8 +17,6 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,7 +24,7 @@
 
 static int open_s(stream_t *stream)
 {
-  return 1;
+    return 1;
 }
 
 const stream_info_t stream_info_null = {

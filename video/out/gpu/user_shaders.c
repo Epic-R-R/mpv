@@ -102,7 +102,7 @@ bool eval_szexpr(struct mp_log *log, void *priv,
 
             switch (expr[i].val.op) {
             case SZEXP_OP_NOT: stack[idx-1] = !stack[idx-1]; break;
-            default: abort();
+            default: MP_ASSERT_UNREACHABLE();
             }
             continue;
 
@@ -125,7 +125,7 @@ bool eval_szexpr(struct mp_log *log, void *priv,
             case SZEXP_OP_GT:  res = op1 > op2; break;
             case SZEXP_OP_LT:  res = op1 < op2; break;
             case SZEXP_OP_EQ:  res = op1 == op2; break;
-            default: abort();
+            default: MP_ASSERT_UNREACHABLE();
             }
 
             if (!isfinite(res)) {
@@ -431,7 +431,7 @@ static bool parse_tex(struct mp_log *log, struct ra *ra, struct bstr *body,
 
 void parse_user_shader(struct mp_log *log, struct ra *ra, struct bstr shader,
                        void *priv,
-                       bool (*dohook)(void *p, struct gl_user_shader_hook hook),
+                       bool (*dohook)(void *p, const struct gl_user_shader_hook *hook),
                        bool (*dotex)(void *p, struct gl_user_shader_tex tex))
 {
     if (!dohook || !dotex || !shader.len)
@@ -457,7 +457,7 @@ void parse_user_shader(struct mp_log *log, struct ra *ra, struct bstr shader,
         }
 
         struct gl_user_shader_hook h;
-        if (!parse_hook(log, &shader, &h) || !dohook(priv, h))
+        if (!parse_hook(log, &shader, &h) || !dohook(priv, &h))
             return;
     }
 }

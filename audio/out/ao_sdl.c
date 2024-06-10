@@ -18,7 +18,6 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
 #include "audio/format.h"
 #include "mpv_talloc.h"
 #include "ao.h"
@@ -62,7 +61,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len)
     // fixed latency.
     double delay = 2 * len / (double)ao->bps;
 
-    ao_read_data(ao, data, len / ao->sstride, mp_time_us() + 1000000LL * delay);
+    ao_read_data(ao, data, len / ao->sstride, mp_time_ns() + MP_TIME_S_TO_NS(delay), NULL, true, true);
 }
 
 static void uninit(struct ao *ao)

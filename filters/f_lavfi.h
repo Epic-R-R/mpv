@@ -18,6 +18,7 @@ struct mp_lavfi {
 //  graph: a libavfilter graph specification
 struct mp_lavfi *mp_lavfi_create_graph(struct mp_filter *parent,
                                        enum mp_frame_type type, bool bidir,
+                                       char *hwdec_interop,
                                        char **graph_opts, const char *graph);
 
 // Unlike mp_lavfi_create_graph(), this creates a single filter, using explicit
@@ -26,9 +27,11 @@ struct mp_lavfi *mp_lavfi_create_graph(struct mp_filter *parent,
 // (which are applied with mp_set_avopts()).
 struct mp_lavfi *mp_lavfi_create_filter(struct mp_filter *parent,
                                         enum mp_frame_type type, bool bidir,
+                                        char *hwdec_interop,
                                         char **graph_opts,
                                         const char *filter, char **filter_opts);
 
+struct mp_log;
 // Print libavfilter list for --vf/--af
 void print_lavfi_help_list(struct mp_log *log, int media_type);
 
@@ -37,3 +40,5 @@ void print_lavfi_help(struct mp_log *log, const char *name, int media_type);
 
 // Return whether the given filter exists and has the required media_type in/outs.
 bool mp_lavfi_is_usable(const char *name, int media_type);
+
+const char **mp_get_lavfi_filters(void *talloc_ctx, int media_type);

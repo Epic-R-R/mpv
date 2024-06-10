@@ -24,7 +24,9 @@ stats:
 1      Show usual stats
 2      Show frame timings (scroll)
 3      Input cache stats
-4      Internal stuff (scroll)
+4      Active key bindings (scroll)
+5      Selected Tracks Info (scroll)
+0      Internal stuff (scroll)
 ====   ==================
 
 On pages which support scroll, these key bindings are also active:
@@ -34,29 +36,18 @@ UP      Scroll one line up
 DOWN    Scroll one line down
 ====   ==================
 
-Font
-~~~~
-
-For optimal visual experience, a font with support for many font weights and
-monospaced digits is recommended. By default, the open source font
-`Source Sans Pro <https://github.com/adobe-fonts/source-sans-pro>`_ is used.
+Page 4 also binds ``/`` to search for input bindings by typing part of a binding
+or command.
 
 Configuration
 -------------
 
 This script can be customized through a config file ``script-opts/stats.conf``
 placed in mpv's user directory and through the ``--script-opts`` command-line
-option. The configuration syntax is described in `ON SCREEN CONTROLLER`_.
+option. The configuration syntax is described in `mp.options functions`_.
 
 Configurable Options
 ~~~~~~~~~~~~~~~~~~~~
-
-``key_oneshot``
-    Default: i
-``key_toggle``
-    Default: I
-
-    Key bindings to display stats.
 
 ``key_page_1``
     Default: 1
@@ -66,6 +57,10 @@ Configurable Options
     Default: 3
 ``key_page_4``
     Default: 4
+``key_page_5``
+    Default: 5
+``key_page_0``
+    Default: 0
 
     Key bindings for page switching while stats are displayed.
 
@@ -73,6 +68,8 @@ Configurable Options
     Default: UP
 ``key_scroll_down``
     Default: DOWN
+``key_scroll_search``
+    Default: /
 ``scroll_lines``
     Default: 1
 
@@ -96,6 +93,28 @@ Configurable Options
     respective duration. This can result in overlapping text when multiple
     scripts decide to print text at the same time.
 
+``file_tag_max_length``
+    Default: 128
+
+    Only show file tags shorter than this length, in bytes.
+
+``file_tag_max_count``
+    Default: 16
+
+    Only show the first specified amount of file tags.
+
+``term_width_limit``
+    Default: -1
+
+    Sets the terminal width.
+    A value of 0 means the width is infinite, -1 means it's automatic.
+
+``term_height_limit``
+    Default: -1
+
+    Sets the terminal height.
+    A value of 0 means the height is infinite, -1 means it's automatic.
+
 ``plot_perfdata``
     Default: yes
 
@@ -108,19 +127,24 @@ Configurable Options
 
     Show graphs for vsync and jitter values (page 1). Only when toggled.
 
+``plot_tonemapping_lut``
+    Default: no
+
+    Enable tone-mapping LUT visualization automatically. Only when toggled.
+
 ``flush_graph_data``
     Default: yes
 
     Clear data buffers used for drawing graphs when toggling.
 
 ``font``
-    Default: Source Sans Pro
+    Default: same as ``osd-font``
 
     Font name. Should support as many font weights as possible for optimal
     visual experience.
 
 ``font_mono``
-    Default: Source Sans Pro
+    Default: monospace
 
     Font name for parts where monospaced characters are necessary to align
     text. Currently, monospaced digits are sufficient.
@@ -131,9 +155,9 @@ Configurable Options
     Font size used to render text.
 
 ``font_color``
-    Default: FFFFFF
+    Default: same as ``osd-color``
 
-    Font color.
+    Color of the text.
 
 ``border_size``
     Default: 0.8
@@ -141,19 +165,41 @@ Configurable Options
     Size of border drawn around the font.
 
 ``border_color``
-    Default: 262626
+    Default: same as ``osd-border-color``
 
-    Color of drawn border.
+    Color of the text border.
+
+``shadow_x_offset``
+    Default: 0
+
+    The horizontal distance from the text to position the shadow at.
+
+``shadow_y_offset``
+    Default: 0
+
+    The vertical distance from the text to position the shadow at.
+
+``shadow_color``
+    Default: same as ``osd-shadow-color``
+
+    Color of the text shadow.
 
 ``alpha``
     Default: 11
 
-    Transparency for drawn text.
+    Transparency of text when ``font_color`` is specified, of text borders when
+    ``border_color`` is specified, and of text shadows when ``shadow_color`` is
+    specified.
 
 ``plot_bg_border_color``
     Default: 0000FF
 
     Border color used for drawing graphs.
+
+``plot_bg_border_width``
+    Default: 0.5
+
+    Border width used for drawing graphs.
 
 ``plot_bg_color``
     Default: 262626
@@ -165,23 +211,49 @@ Configurable Options
 
     Color used for drawing graphs.
 
+``vidscale``
+    Default: auto
+
+    Scale the text and graphs with the video.
+    ``no`` tries to keep the sizes constant.
+    ``auto`` scales the text and graphs with the OSD, which is scaled with the
+    window or kept at a constant size, depending on the ``--osd-scale-by-window`` option.
+
 Note: colors are given as hexadecimal values and use ASS tag order: BBGGRR
 (blue green red).
 
 Different key bindings
 ~~~~~~~~~~~~~~~~~~~~~~
 
-A different key binding can be defined with the aforementioned options
-``key_oneshot`` and ``key_toggle`` but also with commands in ``input.conf``,
-for example::
+Additional keys can be configured in ``input.conf`` to display the stats::
 
     e script-binding stats/display-stats
     E script-binding stats/display-stats-toggle
 
-Using ``input.conf``, it is also possible to directly display a certain page::
+And to display a certain page directly::
 
     i script-binding stats/display-page-1
     e script-binding stats/display-page-2
+
+Active key bindings page
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Lists the active key bindings and the commands they're bound to, excluding the
+interactive keys of the stats script itself. See also ``--input-test`` for more
+detailed view of each binding.
+
+The keys are grouped automatically using a simple analysis of the command
+string, and one should not expect documentation-level grouping accuracy,
+however, it should still be reasonably useful.
+
+Using ``--idle --script-opts=stats-bindlist=yes`` will print the list to the
+terminal and quit immediately. By default long lines are shortened to 79 chars,
+and terminal escape sequences are enabled. A different length limit can be
+set by changing ``yes`` to a number (at least 40), and escape sequences can be
+disabled by adding ``-`` before the value, e.g. ``...=-yes`` or ``...=-120``.
+
+Like with ``--input-test``, the list includes bindings from ``input.conf`` and
+from user scripts. Use ``--no-config`` to list only built-in bindings.
 
 Internal stuff page
 ~~~~~~~~~~~~~~~~~~~
@@ -213,8 +285,8 @@ are missing.
 Memory usage is approximate and does not reflect internal fragmentation.
 
 JS scripts memory reporting is disabled by default because collecting the data
-at the JS side has an overhead. It can be enabled by exporting the env var
-``MPV_LEAK_REPORT=1`` before starting mpv, and will increase JS memory usage.
+at the JS side has an overhead and will increase memory usage. It can be
+enabled by setting the ``--js-memory-report`` option before starting mpv.
 
 If entries have ``/time`` and ``/cpu`` variants, the former gives the real time
 (monotonic clock), while the latter the thread CPU time (only if the

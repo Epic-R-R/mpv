@@ -25,6 +25,7 @@
 #include <limits.h>
 #include <math.h>
 #include <time.h>
+#include <drm_fourcc.h>
 
 #include "config.h"
 
@@ -34,13 +35,17 @@
 #include <sys/vt.h>
 #endif
 
+#include "drm_atomic.h"
 #include "drm_common.h"
 
 #include "common/common.h"
 #include "common/msg.h"
-#include "osdep/io.h"
-#include "osdep/timer.h"
 #include "misc/ctype.h"
+#include "options/m_config.h"
+#include "osdep/io.h"
+#include "osdep/poll_wrapper.h"
+#include "osdep/timer.h"
+#include "present_sync.h"
 #include "video/out/vo.h"
 
 #define EVT_RELEASE 1
@@ -54,53 +59,55 @@
 
 static int vt_switcher_pipe[2];
 
-static int drm_connector_opt_help(
-    struct mp_log *log, const struct m_option *opt, struct bstr name);
+static int drm_connector_opt_help(struct mp_log *log, const struct m_option *opt,
+                                  struct bstr name);
 
-static int drm_mode_opt_help(
-    struct mp_log *log, const struct m_option *opt, struct bstr name);
+static int drm_mode_opt_help(struct mp_log *log, const struct m_option *opt,
+                             struct bstr name);
 
-static int drm_validate_mode_opt(
-    struct mp_log *log, const struct m_option *opt, struct bstr name,
-    const char **value);
+static OPT_STRING_VALIDATE_FUNC(drm_validate_mode_opt);
 
-static void kms_show_available_modes(
-    struct mp_log *log, const drmModeConnector *connector);
+static void drm_show_available_modes(struct mp_log *log, const drmModeConnector *connector);
 
-static void kms_show_available_connectors(struct mp_log *log, int card_no);
+static void drm_show_available_connectors(struct mp_log *log, int card_no,
+                                          const char *card_path);
 static double mode_get_Hz(const drmModeModeInfo *mode);
 
 #define OPT_BASE_STRUCT struct drm_opts
 const struct m_sub_options drm_conf = {
     .opts = (const struct m_option[]) {
-        {"drm-connector", OPT_STRING(drm_connector_spec),
+        {"drm-device", OPT_STRING(device_path), .flags = M_OPT_FILE},
+        {"drm-connector", OPT_STRING(connector_spec),
             .help = drm_connector_opt_help},
-        {"drm-mode", OPT_STRING_VALIDATE(drm_mode_spec, drm_validate_mode_opt),
+        {"drm-mode", OPT_STRING_VALIDATE(mode_spec, drm_validate_mode_opt),
             .help = drm_mode_opt_help},
-        {"drm-atomic", OPT_CHOICE(drm_atomic, {"no", 0}, {"auto", 1})},
-        {"drm-draw-plane", OPT_CHOICE(drm_draw_plane,
+        {"drm-atomic", OPT_CHOICE(drm_atomic, {"no", 0}, {"auto", 1}),
+            .deprecation_message = "this option is deprecated: DRM Atomic is required"},
+        {"drm-draw-plane", OPT_CHOICE(draw_plane,
             {"primary", DRM_OPTS_PRIMARY_PLANE},
             {"overlay", DRM_OPTS_OVERLAY_PLANE}),
             M_RANGE(0, INT_MAX)},
-        {"drm-drmprime-video-plane", OPT_CHOICE(drm_drmprime_video_plane,
+        {"drm-drmprime-video-plane", OPT_CHOICE(drmprime_video_plane,
             {"primary", DRM_OPTS_PRIMARY_PLANE},
             {"overlay", DRM_OPTS_OVERLAY_PLANE}),
             M_RANGE(0, INT_MAX)},
         {"drm-format", OPT_CHOICE(drm_format,
             {"xrgb8888",    DRM_OPTS_FORMAT_XRGB8888},
-            {"xrgb2101010", DRM_OPTS_FORMAT_XRGB2101010})},
-        {"drm-draw-surface-size", OPT_SIZE_BOX(drm_draw_surface_size)},
-
-        {"drm-osd-plane-id", OPT_REPLACED("drm-draw-plane")},
-        {"drm-video-plane-id", OPT_REPLACED("drm-drmprime-video-plane")},
-        {"drm-osd-size", OPT_REPLACED("drm-draw-surface-size")},
+            {"xrgb2101010", DRM_OPTS_FORMAT_XRGB2101010},
+            {"xbgr8888",    DRM_OPTS_FORMAT_XBGR8888},
+            {"xbgr2101010", DRM_OPTS_FORMAT_XBGR2101010},
+            {"yuyv",        DRM_OPTS_FORMAT_YUYV})},
+        {"drm-draw-surface-size", OPT_SIZE_BOX(draw_surface_size)},
+        {"drm-vrr-enabled", OPT_CHOICE(vrr_enabled,
+            {"no", 0}, {"yes", 1}, {"auto", -1})},
         {0},
     },
     .defaults = &(const struct drm_opts) {
-        .drm_mode_spec = "preferred",
+        .mode_spec = "preferred",
         .drm_atomic = 1,
-        .drm_draw_plane = DRM_OPTS_PRIMARY_PLANE,
-        .drm_drmprime_video_plane = DRM_OPTS_OVERLAY_PLANE,
+        .draw_plane = DRM_OPTS_PRIMARY_PLANE,
+        .drmprime_video_plane = DRM_OPTS_OVERLAY_PLANE,
+        .drm_format = DRM_OPTS_FORMAT_XRGB8888,
     },
     .size = sizeof(struct drm_opts),
 };
@@ -124,6 +131,9 @@ static const char *connector_names[] = {
     "Virtual",   // DRM_MODE_CONNECTOR_VIRTUAL
     "DSI",       // DRM_MODE_CONNECTOR_DSI
     "DPI",       // DRM_MODE_CONNECTOR_DPI
+    "Writeback", // DRM_MODE_CONNECTOR_WRITEBACK
+    "SPI",       // DRM_MODE_CONNECTOR_SPI
+    "USB",       // DRM_MODE_CONNECTOR_USB
 };
 
 struct drm_mode_spec {
@@ -139,26 +149,326 @@ struct drm_mode_spec {
     double refresh;
 };
 
-// KMS ------------------------------------------------------------------------
+/* VT Switcher */
+static void vt_switcher_sighandler(int sig)
+{
+    int saved_errno = errno;
+    unsigned char event = sig == RELEASE_SIGNAL ? EVT_RELEASE : EVT_ACQUIRE;
+    (void)write(vt_switcher_pipe[1], &event, sizeof(event));
+    errno = saved_errno;
+}
 
+static bool has_signal_installed(int signo)
+{
+    struct sigaction act = { 0 };
+    sigaction(signo, 0, &act);
+    return act.sa_handler != 0;
+}
+
+static int install_signal(int signo, void (*handler)(int))
+{
+    struct sigaction act = { 0 };
+    act.sa_handler = handler;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_RESTART;
+    return sigaction(signo, &act, NULL);
+}
+
+static void release_vt(void *data)
+{
+    struct vo_drm_state *drm = data;
+    MP_VERBOSE(drm, "Releasing VT\n");
+    vo_drm_release_crtc(drm);
+}
+
+static void acquire_vt(void *data)
+{
+    struct vo_drm_state *drm = data;
+    MP_VERBOSE(drm, "Acquiring VT\n");
+    vo_drm_acquire_crtc(drm);
+}
+
+static void vt_switcher_acquire(struct vt_switcher *s,
+                         void (*handler)(void*), void *user_data)
+{
+    s->handlers[HANDLER_ACQUIRE] = handler;
+    s->handler_data[HANDLER_ACQUIRE] = user_data;
+}
+
+static void vt_switcher_release(struct vt_switcher *s,
+                         void (*handler)(void*), void *user_data)
+{
+    s->handlers[HANDLER_RELEASE] = handler;
+    s->handler_data[HANDLER_RELEASE] = user_data;
+}
+
+static bool vt_switcher_init(struct vt_switcher *s, struct mp_log *log)
+{
+    s->tty_fd = -1;
+    s->log = log;
+    vt_switcher_pipe[0] = -1;
+    vt_switcher_pipe[1] = -1;
+
+    if (mp_make_cloexec_pipe(vt_switcher_pipe)) {
+        mp_err(log, "Creating pipe failed: %s\n", mp_strerror(errno));
+        return false;
+    }
+
+    s->tty_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (s->tty_fd < 0) {
+        mp_err(log, "Can't open TTY for VT control: %s\n", mp_strerror(errno));
+        return false;
+    }
+
+    if (has_signal_installed(RELEASE_SIGNAL)) {
+        mp_err(log, "Can't handle VT release - signal already used\n");
+        return false;
+    }
+    if (has_signal_installed(ACQUIRE_SIGNAL)) {
+        mp_err(log, "Can't handle VT acquire - signal already used\n");
+        return false;
+    }
+
+    if (install_signal(RELEASE_SIGNAL, vt_switcher_sighandler)) {
+        mp_err(log, "Failed to install release signal: %s\n", mp_strerror(errno));
+        return false;
+    }
+    if (install_signal(ACQUIRE_SIGNAL, vt_switcher_sighandler)) {
+        mp_err(log, "Failed to install acquire signal: %s\n", mp_strerror(errno));
+        return false;
+    }
+
+    struct vt_mode vt_mode = { 0 };
+    if (ioctl(s->tty_fd, VT_GETMODE, &vt_mode) < 0) {
+        mp_err(log, "VT_GETMODE failed: %s\n", mp_strerror(errno));
+        return false;
+    }
+
+    vt_mode.mode = VT_PROCESS;
+    vt_mode.relsig = RELEASE_SIGNAL;
+    vt_mode.acqsig = ACQUIRE_SIGNAL;
+    // frsig is a signal for forced release. Not implemented on Linux,
+    // Solaris, BSDs but must be set to a valid signal on some of those.
+    vt_mode.frsig = SIGIO; // unused
+    if (ioctl(s->tty_fd, VT_SETMODE, &vt_mode) < 0) {
+        mp_err(log, "VT_SETMODE failed: %s\n", mp_strerror(errno));
+        return false;
+    }
+
+    // Block the VT switching signals from interrupting the VO thread (they will
+    // still be picked up by other threads, which will fill vt_switcher_pipe for us)
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, RELEASE_SIGNAL);
+    sigaddset(&set, ACQUIRE_SIGNAL);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    return true;
+}
+
+static void vt_switcher_interrupt_poll(struct vt_switcher *s)
+{
+    unsigned char event = EVT_INTERRUPT;
+    (void)write(vt_switcher_pipe[1], &event, sizeof(event));
+}
+
+static void vt_switcher_destroy(struct vt_switcher *s)
+{
+    struct vt_mode vt_mode = {0};
+    vt_mode.mode = VT_AUTO;
+    if (ioctl(s->tty_fd, VT_SETMODE, &vt_mode) < 0) {
+        MP_ERR(s, "VT_SETMODE failed: %s\n", mp_strerror(errno));
+        return;
+    }
+
+    install_signal(RELEASE_SIGNAL, SIG_DFL);
+    install_signal(ACQUIRE_SIGNAL, SIG_DFL);
+    close(s->tty_fd);
+    close(vt_switcher_pipe[0]);
+    close(vt_switcher_pipe[1]);
+}
+
+static void vt_switcher_poll(struct vt_switcher *s, int timeout_ns)
+{
+    struct pollfd fds[1] = {
+        { .events = POLLIN, .fd = vt_switcher_pipe[0] },
+    };
+    mp_poll(fds, 1, timeout_ns);
+    if (!fds[0].revents)
+        return;
+
+    unsigned char event;
+    if (read(fds[0].fd, &event, sizeof(event)) != sizeof(event))
+        return;
+
+    switch (event) {
+    case EVT_RELEASE:
+        s->handlers[HANDLER_RELEASE](s->handler_data[HANDLER_RELEASE]);
+        if (ioctl(s->tty_fd, VT_RELDISP, 1) < 0) {
+            MP_ERR(s, "Failed to release virtual terminal\n");
+        }
+        break;
+    case EVT_ACQUIRE:
+        s->handlers[HANDLER_ACQUIRE](s->handler_data[HANDLER_ACQUIRE]);
+        if (ioctl(s->tty_fd, VT_RELDISP, VT_ACKACQ) < 0) {
+            MP_ERR(s, "Failed to acquire virtual terminal\n");
+        }
+        break;
+    case EVT_INTERRUPT:
+        break;
+    }
+}
+
+bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
+{
+    if (drm->active)
+        return true;
+    drm->active = true;
+
+    if (drmSetMaster(drm->fd)) {
+        MP_WARN(drm, "Failed to acquire DRM master: %s\n",
+                mp_strerror(errno));
+    }
+
+    struct drm_atomic_context *atomic_ctx = drm->atomic_context;
+
+    if (!drm_atomic_save_old_state(atomic_ctx))
+        MP_WARN(drm, "Failed to save old DRM atomic state\n");
+
+    drmModeAtomicReqPtr request = drmModeAtomicAlloc();
+    if (!request) {
+        MP_ERR(drm, "Failed to allocate drm atomic request\n");
+        goto err;
+    }
+
+    if (drm_object_set_property(request, atomic_ctx->connector, "CRTC_ID", drm->crtc_id) < 0) {
+        MP_ERR(drm, "Could not set CRTC_ID on connector\n");
+        goto err;
+    }
+
+    if (!drm_mode_ensure_blob(drm->fd, &drm->mode)) {
+        MP_ERR(drm, "Failed to create DRM mode blob\n");
+        goto err;
+    }
+    if (drm_object_set_property(request, atomic_ctx->crtc, "MODE_ID", drm->mode.blob_id) < 0) {
+        MP_ERR(drm, "Could not set MODE_ID on crtc\n");
+        goto err;
+    }
+    if (drm_object_set_property(request, atomic_ctx->crtc, "ACTIVE", 1) < 0) {
+        MP_ERR(drm, "Could not set ACTIVE on crtc\n");
+        goto err;
+    }
+
+    /*
+     * VRR related properties were added in kernel 5.0. We will not fail if we
+     * cannot query or set the value, but we will log as appropriate.
+     */
+    uint64_t vrr_capable = 0;
+    drm_object_get_property(atomic_ctx->connector, "VRR_CAPABLE", &vrr_capable);
+    MP_VERBOSE(drm, "crtc is%s VRR capable\n", vrr_capable ? "" : " not");
+
+    uint64_t vrr_requested = drm->opts->vrr_enabled;
+    if (vrr_requested == 1 || (vrr_capable && vrr_requested == -1)) {
+        if (drm_object_set_property(request, atomic_ctx->crtc, "VRR_ENABLED", 1) < 0) {
+            MP_WARN(drm, "Could not enable VRR on crtc\n");
+        } else {
+            MP_VERBOSE(drm, "Enabled VRR on crtc\n");
+        }
+    }
+
+    drm_object_set_property(request, atomic_ctx->draw_plane, "FB_ID",   drm->fb->id);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "CRTC_ID", drm->crtc_id);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "SRC_X",   0);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "SRC_Y",   0);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "SRC_W",   drm->width << 16);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "SRC_H",   drm->height << 16);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "CRTC_X",  0);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "CRTC_Y",  0);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "CRTC_W",  drm->mode.mode.hdisplay);
+    drm_object_set_property(request, atomic_ctx->draw_plane, "CRTC_H",  drm->mode.mode.vdisplay);
+
+    if (drmModeAtomicCommit(drm->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL)) {
+        MP_ERR(drm, "Failed to commit ModeSetting atomic request: %s\n", mp_strerror(errno));
+        goto err;
+    }
+
+    drmModeAtomicFree(request);
+    return true;
+
+err:
+    drmModeAtomicFree(request);
+    return false;
+}
+
+
+void vo_drm_release_crtc(struct vo_drm_state *drm)
+{
+    if (!drm->active)
+        return;
+    drm->active = false;
+
+    if (!drm->atomic_context->old_state.saved)
+        return;
+
+    bool success = true;
+    struct drm_atomic_context *atomic_ctx = drm->atomic_context;
+    drmModeAtomicReqPtr request = drmModeAtomicAlloc();
+    if (!request) {
+        MP_ERR(drm, "Failed to allocate drm atomic request\n");
+        success = false;
+    }
+
+    if (request && !drm_atomic_restore_old_state(request, atomic_ctx)) {
+        MP_WARN(drm, "Got error while restoring old state\n");
+        success = false;
+    }
+
+    if (request) {
+        if (drmModeAtomicCommit(drm->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL)) {
+            MP_WARN(drm, "Failed to commit ModeSetting atomic request: %s\n",
+                    mp_strerror(errno));
+            success = false;
+        }
+    }
+
+    if (request)
+        drmModeAtomicFree(request);
+
+    if (!success)
+        MP_ERR(drm, "Failed to restore previous mode\n");
+
+    if (drmDropMaster(drm->fd)) {
+        MP_WARN(drm, "Failed to drop DRM master: %s\n",
+                mp_strerror(errno));
+    }
+}
+
+/* libdrm */
 static void get_connector_name(const drmModeConnector *connector,
                                char ret[MAX_CONNECTOR_NAME_LEN])
 {
-    snprintf(ret, MAX_CONNECTOR_NAME_LEN, "%s-%d",
-             connector_names[connector->connector_type],
+    const char *type_name;
+
+    if (connector->connector_type < MP_ARRAY_SIZE(connector_names)) {
+        type_name = connector_names[connector->connector_type];
+    } else {
+        type_name = "UNKNOWN";
+    }
+
+    snprintf(ret, MAX_CONNECTOR_NAME_LEN, "%s-%d", type_name,
              connector->connector_type_id);
 }
 
 // Gets the first connector whose name matches the input parameter.
 // The returned connector may be disconnected.
 // Result must be freed with drmModeFreeConnector.
-static drmModeConnector *get_connector_by_name(const struct kms *kms,
-                                               const drmModeRes *res,
-                                               const char *connector_name)
+static drmModeConnector *get_connector_by_name(const drmModeRes *res,
+                                               const char *connector_name,
+                                               int fd)
 {
     for (int i = 0; i < res->count_connectors; i++) {
         drmModeConnector *connector
-            = drmModeGetConnector(kms->fd, res->connectors[i]);
+            = drmModeGetConnector(fd, res->connectors[i]);
         if (!connector)
             continue;
         char other_connector_name[MAX_CONNECTOR_NAME_LEN];
@@ -172,16 +482,14 @@ static drmModeConnector *get_connector_by_name(const struct kms *kms,
 
 // Gets the first connected connector.
 // Result must be freed with drmModeFreeConnector.
-static drmModeConnector *get_first_connected_connector(const struct kms *kms,
-                                                       const drmModeRes *res)
+static drmModeConnector *get_first_connected_connector(const drmModeRes *res,
+                                                       int fd)
 {
     for (int i = 0; i < res->count_connectors; i++) {
-        drmModeConnector *connector
-            = drmModeGetConnector(kms->fd, res->connectors[i]);
+        drmModeConnector *connector = drmModeGetConnector(fd, res->connectors[i]);
         if (!connector)
             continue;
-        if (connector->connection == DRM_MODE_CONNECTED
-        && connector->count_modes > 0) {
+        if (connector->connection == DRM_MODE_CONNECTED && connector->count_modes > 0) {
             return connector;
         }
         drmModeFreeConnector(connector);
@@ -189,60 +497,58 @@ static drmModeConnector *get_first_connected_connector(const struct kms *kms,
     return NULL;
 }
 
-static bool setup_connector(struct kms *kms, const drmModeRes *res,
+static bool setup_connector(struct vo_drm_state *drm, const drmModeRes *res,
                             const char *connector_name)
 {
     drmModeConnector *connector;
 
-    if (connector_name
-    && strcmp(connector_name, "")
-    && strcmp(connector_name, "auto")) {
-        connector = get_connector_by_name(kms, res, connector_name);
+    if (connector_name && strcmp(connector_name, "") && strcmp(connector_name, "auto")) {
+        connector = get_connector_by_name(res, connector_name, drm->fd);
         if (!connector) {
-            MP_ERR(kms, "No connector with name %s found\n", connector_name);
-            kms_show_available_connectors(kms->log, kms->card_no);
+            MP_ERR(drm, "No connector with name %s found\n", connector_name);
+            drm_show_available_connectors(drm->log, drm->card_no, drm->card_path);
             return false;
         }
     } else {
-        connector = get_first_connected_connector(kms, res);
+        connector = get_first_connected_connector(res, drm->fd);
         if (!connector) {
-            MP_ERR(kms, "No connected connectors found\n");
+            MP_ERR(drm, "No connected connectors found\n");
             return false;
         }
     }
 
     if (connector->connection != DRM_MODE_CONNECTED) {
         drmModeFreeConnector(connector);
-        MP_ERR(kms, "Chosen connector is disconnected\n");
+        MP_ERR(drm, "Chosen connector is disconnected\n");
         return false;
     }
 
     if (connector->count_modes == 0) {
         drmModeFreeConnector(connector);
-        MP_ERR(kms, "Chosen connector has no valid modes\n");
+        MP_ERR(drm, "Chosen connector has no valid modes\n");
         return false;
     }
 
-    kms->connector = connector;
+    drm->connector = connector;
     return true;
 }
 
-static bool setup_crtc(struct kms *kms, const drmModeRes *res)
+static bool setup_crtc(struct vo_drm_state *drm, const drmModeRes *res)
 {
     // First try to find currently connected encoder and its current CRTC
     for (unsigned int i = 0; i < res->count_encoders; i++) {
-        drmModeEncoder *encoder = drmModeGetEncoder(kms->fd, res->encoders[i]);
+        drmModeEncoder *encoder = drmModeGetEncoder(drm->fd, res->encoders[i]);
         if (!encoder) {
-            MP_WARN(kms, "Cannot retrieve encoder %u:%u: %s\n",
+            MP_WARN(drm, "Cannot retrieve encoder %u:%u: %s\n",
                     i, res->encoders[i], mp_strerror(errno));
             continue;
         }
 
-        if (encoder->encoder_id == kms->connector->encoder_id && encoder->crtc_id != 0) {
-            MP_VERBOSE(kms, "Connector %u currently connected to encoder %u\n",
-                       kms->connector->connector_id, kms->connector->encoder_id);
-            kms->encoder = encoder;
-            kms->crtc_id = encoder->crtc_id;
+        if (encoder->encoder_id == drm->connector->encoder_id && encoder->crtc_id != 0) {
+            MP_VERBOSE(drm, "Connector %u currently connected to encoder %u\n",
+                       drm->connector->connector_id, drm->connector->encoder_id);
+            drm->encoder = encoder;
+            drm->crtc_id = encoder->crtc_id;
             goto success;
         }
 
@@ -250,12 +556,12 @@ static bool setup_crtc(struct kms *kms, const drmModeRes *res)
     }
 
     // Otherwise pick first legal encoder and CRTC combo for the connector
-    for (unsigned int i = 0; i < kms->connector->count_encoders; ++i) {
+    for (unsigned int i = 0; i < drm->connector->count_encoders; ++i) {
         drmModeEncoder *encoder
-            = drmModeGetEncoder(kms->fd, kms->connector->encoders[i]);
+            = drmModeGetEncoder(drm->fd, drm->connector->encoders[i]);
         if (!encoder) {
-            MP_WARN(kms, "Cannot retrieve encoder %u:%u: %s\n",
-                    i, kms->connector->encoders[i], mp_strerror(errno));
+            MP_WARN(drm, "Cannot retrieve encoder %u:%u: %s\n",
+                    i, drm->connector->encoders[i], mp_strerror(errno));
             continue;
         }
 
@@ -265,21 +571,21 @@ static bool setup_crtc(struct kms *kms, const drmModeRes *res)
             if (!(encoder->possible_crtcs & (1 << j)))
                 continue;
 
-            kms->encoder = encoder;
-            kms->crtc_id = res->crtcs[j];
+            drm->encoder = encoder;
+            drm->crtc_id = res->crtcs[j];
             goto success;
         }
 
         drmModeFreeEncoder(encoder);
     }
 
-    MP_ERR(kms, "Connector %u has no suitable CRTC\n",
-           kms->connector->connector_id);
+    MP_ERR(drm, "Connector %u has no suitable CRTC\n",
+           drm->connector->connector_id);
     return false;
 
-  success:
-    MP_VERBOSE(kms, "Selected Encoder %u with CRTC %u\n",
-               kms->encoder->encoder_id, kms->crtc_id);
+success:
+    MP_VERBOSE(drm, "Selected Encoder %u with CRTC %u\n",
+               drm->encoder->encoder_id, drm->crtc_id);
     return true;
 }
 
@@ -368,15 +674,15 @@ static bool parse_mode_spec(const char *spec, struct drm_mode_spec *parse_result
     return true;
 }
 
-static bool setup_mode_by_idx(struct kms *kms, unsigned int mode_idx)
+static bool setup_mode_by_idx(struct vo_drm_state *drm, unsigned int mode_idx)
 {
-    if (mode_idx >= kms->connector->count_modes) {
-        MP_ERR(kms, "Bad mode index (max = %d).\n",
-               kms->connector->count_modes - 1);
+    if (mode_idx >= drm->connector->count_modes) {
+        MP_ERR(drm, "Bad mode index (max = %d).\n",
+               drm->connector->count_modes - 1);
         return false;
     }
 
-    kms->mode.mode = kms->connector->modes[mode_idx];
+    drm->mode.mode = drm->connector->modes[mode_idx];
     return true;
 }
 
@@ -398,46 +704,45 @@ static bool mode_match(const drmModeModeInfo *mode,
     }
 }
 
-static bool setup_mode_by_numbers(struct kms *kms,
+static bool setup_mode_by_numbers(struct vo_drm_state *drm,
                                   unsigned int width,
                                   unsigned int height,
-                                  double refresh,
-                                  const char *mode_spec)
+                                  double refresh)
 {
-    for (unsigned int i = 0; i < kms->connector->count_modes; ++i) {
-        drmModeModeInfo *current_mode = &kms->connector->modes[i];
+    for (unsigned int i = 0; i < drm->connector->count_modes; ++i) {
+        drmModeModeInfo *current_mode = &drm->connector->modes[i];
         if (mode_match(current_mode, width, height, refresh)) {
-            kms->mode.mode = *current_mode;
+            drm->mode.mode = *current_mode;
             return true;
         }
     }
 
-    MP_ERR(kms, "Could not find mode matching %s\n", mode_spec);
+    MP_ERR(drm, "Could not find mode matching %s\n", drm->opts->mode_spec);
     return false;
 }
 
-static bool setup_mode_preferred(struct kms *kms)
+static bool setup_mode_preferred(struct vo_drm_state *drm)
 {
-    for (unsigned int i = 0; i < kms->connector->count_modes; ++i) {
-        drmModeModeInfo *current_mode = &kms->connector->modes[i];
+    for (unsigned int i = 0; i < drm->connector->count_modes; ++i) {
+        drmModeModeInfo *current_mode = &drm->connector->modes[i];
         if (current_mode->type & DRM_MODE_TYPE_PREFERRED) {
-            kms->mode.mode = *current_mode;
+            drm->mode.mode = *current_mode;
             return true;
         }
     }
 
     // Fall back to first mode
-    MP_WARN(kms, "Could not find any preferred mode. Picking the first mode.\n");
-    kms->mode.mode = kms->connector->modes[0];
+    MP_WARN(drm, "Could not find any preferred mode. Picking the first mode.\n");
+    drm->mode.mode = drm->connector->modes[0];
     return true;
 }
 
-static bool setup_mode_highest(struct kms *kms)
+static bool setup_mode_highest(struct vo_drm_state *drm)
 {
     unsigned int area = 0;
-    drmModeModeInfo *highest_resolution_mode = &kms->connector->modes[0];
-    for (unsigned int i = 0; i < kms->connector->count_modes; ++i) {
-        drmModeModeInfo *current_mode = &kms->connector->modes[i];
+    drmModeModeInfo *highest_resolution_mode = &drm->connector->modes[0];
+    for (unsigned int i = 0; i < drm->connector->count_modes; ++i) {
+        drmModeModeInfo *current_mode = &drm->connector->modes[i];
 
         const unsigned int current_area =
             current_mode->hdisplay * current_mode->vdisplay;
@@ -447,190 +752,323 @@ static bool setup_mode_highest(struct kms *kms)
         }
     }
 
-    kms->mode.mode = *highest_resolution_mode;
+    drm->mode.mode = *highest_resolution_mode;
     return true;
 }
 
-static bool setup_mode(struct kms *kms, const char *mode_spec)
+static bool setup_mode(struct vo_drm_state *drm)
 {
-    if (kms->connector->count_modes <= 0) {
-        MP_ERR(kms, "No available modes\n");
+    if (drm->connector->count_modes <= 0) {
+        MP_ERR(drm, "No available modes\n");
         return false;
     }
 
     struct drm_mode_spec parsed;
-    if (!parse_mode_spec(mode_spec, &parsed)) {
-        MP_ERR(kms, "Parse error\n");
+    if (!parse_mode_spec(drm->opts->mode_spec, &parsed)) {
+        MP_ERR(drm, "Parse error\n");
         goto err;
     }
 
     switch (parsed.type) {
     case DRM_MODE_SPEC_BY_IDX:
-        if (!setup_mode_by_idx(kms, parsed.idx))
+        if (!setup_mode_by_idx(drm, parsed.idx))
             goto err;
         break;
     case DRM_MODE_SPEC_BY_NUMBERS:
-        if (!setup_mode_by_numbers(kms, parsed.width, parsed.height, parsed.refresh,
-                                   mode_spec))
+        if (!setup_mode_by_numbers(drm, parsed.width, parsed.height, parsed.refresh))
             goto err;
         break;
     case DRM_MODE_SPEC_PREFERRED:
-        if (!setup_mode_preferred(kms))
+        if (!setup_mode_preferred(drm))
             goto err;
         break;
     case DRM_MODE_SPEC_HIGHEST:
-        if (!setup_mode_highest(kms))
+        if (!setup_mode_highest(drm))
             goto err;
         break;
     default:
-        MP_ERR(kms, "setup_mode: Internal error\n");
+        MP_ERR(drm, "setup_mode: Internal error\n");
         goto err;
     }
 
-    drmModeModeInfo *mode = &kms->mode.mode;
-    MP_VERBOSE(kms, "Selected mode: %s (%dx%d@%.2fHz)\n",
+    drmModeModeInfo *mode = &drm->mode.mode;
+    MP_VERBOSE(drm, "Selected mode: %s (%dx%d@%.2fHz)\n",
         mode->name, mode->hdisplay, mode->vdisplay, mode_get_Hz(mode));
 
     return true;
 
 err:
-    MP_INFO(kms, "Available modes:\n");
-    kms_show_available_modes(kms->log, kms->connector);
+    MP_INFO(drm, "Available modes:\n");
+    drm_show_available_modes(drm->log, drm->connector);
     return false;
 }
 
-static int open_card(int card_no)
+static int open_card_path(const char *path)
 {
-    char card_path[128];
-    snprintf(card_path, sizeof(card_path), DRM_DEV_NAME, DRM_DIR_NAME, card_no);
-    return open(card_path, O_RDWR | O_CLOEXEC);
+    return open(path, O_RDWR | O_CLOEXEC);
 }
 
-static void parse_connector_spec(struct mp_log *log,
-                                 const char *connector_spec,
-                                 int *card_no, char **connector_name)
+static bool card_supports_kms(const char *path)
 {
-    if (!connector_spec) {
-        *card_no = 0;
-        *connector_name = NULL;
+    int fd = open_card_path(path);
+    bool ret = fd != -1 && drmIsKMS(fd);
+    if (fd != -1)
+        close(fd);
+    return ret;
+}
+
+static bool card_has_connection(const char *path)
+{
+    int fd = open_card_path(path);
+    bool ret = false;
+    if (fd != -1) {
+        drmModeRes *res = drmModeGetResources(fd);
+        if (res) {
+            drmModeConnector *connector = get_first_connected_connector(res, fd);
+            if (connector)
+                ret = true;
+            drmModeFreeConnector(connector);
+            drmModeFreeResources(res);
+        }
+        close(fd);
+    }
+    return ret;
+}
+
+static void get_primary_device_path(struct vo_drm_state *drm)
+{
+    if (drm->opts->device_path) {
+        drm->card_path = talloc_strdup(drm, drm->opts->device_path);
         return;
     }
-    char *dot_ptr = strchr(connector_spec, '.');
-    if (dot_ptr) {
-        *card_no = atoi(connector_spec);
-        *connector_name = talloc_strdup(log, dot_ptr + 1);
-    } else {
-        *card_no = 0;
-        *connector_name = talloc_strdup(log, connector_spec);
-    }
-}
 
-struct kms *kms_create(struct mp_log *log, const char *connector_spec,
-                       const char* mode_spec,
-                       int draw_plane, int drmprime_video_plane,
-                       bool use_atomic)
-{
-    int card_no = -1;
-    char *connector_name = NULL;
-    parse_connector_spec(log, connector_spec, &card_no, &connector_name);
+    drmDevice *devices[DRM_MAX_MINOR] = { 0 };
+    int card_count = drmGetDevices2(0, devices, MP_ARRAY_SIZE(devices));
+    bool card_no_given = drm->card_no >= 0;
 
-    struct kms *kms = talloc(NULL, struct kms);
-    *kms = (struct kms) {
-        .log = mp_log_new(kms, log, "kms"),
-        .fd = open_card(card_no),
-        .connector = NULL,
-        .encoder = NULL,
-        .mode = {{0}},
-        .crtc_id = -1,
-        .card_no = card_no,
-    };
-
-    drmModeRes *res = NULL;
-
-    if (kms->fd < 0) {
-        mp_err(log, "Cannot open card \"%d\": %s.\n",
-               card_no, mp_strerror(errno));
+    if (card_count < 0) {
+        MP_ERR(drm, "Listing DRM devices with drmGetDevices failed! (%s)\n",
+               mp_strerror(errno));
         goto err;
     }
 
-    char *devname = drmGetDeviceNameFromFd(kms->fd);
-    if (devname) {
-        mp_verbose(log, "Device name: %s\n", devname);
-        drmFree(devname);
+    if (card_no_given && drm->card_no > (card_count - 1)) {
+        MP_ERR(drm, "Card number %d given too high! %d devices located.\n",
+               drm->card_no, card_count);
+        goto err;
     }
 
-    drmVersionPtr ver = drmGetVersion(kms->fd);
+    for (int i = card_no_given ? drm->card_no : 0; i < card_count; i++) {
+        drmDevice *dev = devices[i];
+
+        if (!(dev->available_nodes & (1 << DRM_NODE_PRIMARY))) {
+            if (card_no_given) {
+                MP_ERR(drm, "DRM card number %d given, but it does not have "
+                       "a primary node!\n", i);
+                break;
+            }
+
+            continue;
+        }
+
+        const char *card_path = dev->nodes[DRM_NODE_PRIMARY];
+
+        if (!card_supports_kms(card_path)) {
+            if (card_no_given) {
+                MP_ERR(drm,
+                       "DRM card number %d given, but it does not support "
+                       "KMS!\n", i);
+                break;
+            }
+
+            continue;
+        }
+
+        if (!card_has_connection(card_path)) {
+            if (card_no_given) {
+                MP_ERR(drm,
+                        "DRM card number %d given, but it does not have any "
+                        "connected outputs.\n", i);
+                break;
+            }
+
+            continue;
+        }
+
+        MP_VERBOSE(drm, "Picked DRM card %d, primary node %s%s.\n",
+                   i, card_path,
+                   card_no_given ? "" : " as the default");
+
+        drm->card_path = talloc_strdup(drm, card_path);
+        drm->card_no = i;
+        break;
+    }
+
+    if (!drm->card_path)
+        MP_ERR(drm, "No primary DRM device could be picked!\n");
+
+err:
+    drmFreeDevices(devices, card_count);
+}
+
+static void drm_pflip_cb(int fd, unsigned int msc, unsigned int sec,
+                         unsigned int usec, void *data)
+{
+    struct vo_drm_state *drm = data;
+
+    int64_t ust = MP_TIME_S_TO_NS(sec) + MP_TIME_US_TO_NS(usec);
+    present_sync_update_values(drm->present, ust, msc);
+    present_sync_swap(drm->present);
+    drm->waiting_for_flip = false;
+}
+
+int vo_drm_control(struct vo *vo, int *events, int request, void *arg)
+{
+    struct vo_drm_state *drm = vo->drm;
+    switch (request) {
+    case VOCTRL_GET_DISPLAY_FPS: {
+        double fps = vo_drm_get_display_fps(drm);
+        if (fps <= 0)
+            break;
+        *(double*)arg = fps;
+        return VO_TRUE;
+    }
+    case VOCTRL_GET_DISPLAY_RES: {
+        ((int *)arg)[0] = drm->mode.mode.hdisplay;
+        ((int *)arg)[1] = drm->mode.mode.vdisplay;
+        return VO_TRUE;
+    }
+    case VOCTRL_PAUSE:
+        vo->want_redraw = true;
+        drm->paused = true;
+        return VO_TRUE;
+    case VOCTRL_RESUME:
+        drm->paused = false;
+        return VO_TRUE;
+    }
+    return VO_NOTIMPL;
+}
+
+bool vo_drm_init(struct vo *vo)
+{
+    vo->drm = talloc_zero(NULL, struct vo_drm_state);
+    struct vo_drm_state *drm = vo->drm;
+
+    *drm = (struct vo_drm_state) {
+        .vo = vo,
+        .log = mp_log_new(drm, vo->log, "drm"),
+        .mode = {{0}},
+        .crtc_id = -1,
+        .card_no = -1,
+    };
+
+    drm->vt_switcher_active = vt_switcher_init(&drm->vt_switcher, drm->log);
+    if (drm->vt_switcher_active) {
+        vt_switcher_acquire(&drm->vt_switcher, acquire_vt, drm);
+        vt_switcher_release(&drm->vt_switcher, release_vt, drm);
+    } else {
+        MP_WARN(drm, "Failed to set up VT switcher. Terminal switching will be unavailable.\n");
+    }
+
+    drm->opts = mp_get_config_group(drm, drm->vo->global, &drm_conf);
+
+    drmModeRes *res = NULL;
+    get_primary_device_path(drm);
+
+    if (!drm->card_path) {
+        MP_ERR(drm, "Failed to find a usable DRM primary node!\n");
+        goto err;
+    }
+
+    drm->fd = open_card_path(drm->card_path);
+    if (drm->fd < 0) {
+        MP_ERR(drm, "Cannot open card \"%d\": %s.\n", drm->card_no, mp_strerror(errno));
+        goto err;
+    }
+
+    drmVersionPtr ver = drmGetVersion(drm->fd);
     if (ver) {
-        mp_verbose(log, "Driver: %s %d.%d.%d (%s)\n", ver->name,
-            ver->version_major, ver->version_minor, ver->version_patchlevel,
-            ver->date);
+        MP_VERBOSE(drm, "Driver: %s %d.%d.%d (%s)\n", ver->name, ver->version_major,
+                   ver->version_minor, ver->version_patchlevel, ver->date);
         drmFreeVersion(ver);
     }
 
-    res = drmModeGetResources(kms->fd);
+    res = drmModeGetResources(drm->fd);
     if (!res) {
-        mp_err(log, "Cannot retrieve DRM resources: %s\n", mp_strerror(errno));
+        MP_ERR(drm, "Cannot retrieve DRM resources: %s\n", mp_strerror(errno));
         goto err;
     }
 
-    if (!setup_connector(kms, res, connector_name))
+    if (!setup_connector(drm, res, drm->opts->connector_spec))
         goto err;
-    if (!setup_crtc(kms, res))
+    if (!setup_crtc(drm, res))
         goto err;
-    if (!setup_mode(kms, mode_spec))
+    if (!setup_mode(drm))
         goto err;
 
     // Universal planes allows accessing all the planes (including primary)
-    if (drmSetClientCap(kms->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)) {
-        mp_err(log, "Failed to set Universal planes capability\n");
+    if (drmSetClientCap(drm->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)) {
+        MP_ERR(drm, "Failed to set Universal planes capability\n");
     }
 
-    if (!use_atomic) {
-        mp_verbose(log, "Using Legacy Modesetting\n");
-    } else if (drmSetClientCap(kms->fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
-        mp_verbose(log, "No DRM Atomic support found. Falling back to legacy modesetting\n");
+    if (drmSetClientCap(drm->fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
+        MP_ERR(drm, "Failed to create DRM atomic context, no DRM Atomic support\n");
+        goto err;
     } else {
-        mp_verbose(log, "DRM Atomic support found\n");
-        kms->atomic_context = drm_atomic_create_context(kms->log, kms->fd, kms->crtc_id,
-                                                        kms->connector->connector_id,
-                                                        draw_plane, drmprime_video_plane);
-        if (!kms->atomic_context) {
-            mp_err(log, "Failed to create DRM atomic context\n");
+        MP_VERBOSE(drm, "DRM Atomic support found\n");
+        drm->atomic_context = drm_atomic_create_context(drm->log, drm->fd, drm->crtc_id,
+                                                        drm->connector->connector_id,
+                                                        drm->opts->draw_plane,
+                                                        drm->opts->drmprime_video_plane);
+        if (!drm->atomic_context) {
+            MP_ERR(drm, "Failed to create DRM atomic context\n");
             goto err;
         }
     }
 
     drmModeFreeResources(res);
-    return kms;
+
+    drm->ev.version = DRM_EVENT_CONTEXT_VERSION;
+    drm->ev.page_flip_handler = &drm_pflip_cb;
+    drm->present = mp_present_initialize(drm, drm->vo->opts, VO_MAX_SWAPCHAIN_DEPTH);
+
+    return true;
 
 err:
     if (res)
         drmModeFreeResources(res);
-    if (connector_name)
-        talloc_free(connector_name);
-    kms_destroy(kms);
-    return NULL;
+
+    vo_drm_uninit(vo);
+    return false;
 }
 
-void kms_destroy(struct kms *kms)
+void vo_drm_uninit(struct vo *vo)
 {
-    if (!kms)
+    struct vo_drm_state *drm = vo->drm;
+    if (!drm)
         return;
-    drm_mode_destroy_blob(kms->fd, &kms->mode);
-    if (kms->connector) {
-        drmModeFreeConnector(kms->connector);
-        kms->connector = NULL;
+
+    vo_drm_release_crtc(drm);
+    if (drm->vt_switcher_active)
+        vt_switcher_destroy(&drm->vt_switcher);
+
+    drm_mode_destroy_blob(drm->fd, &drm->mode);
+
+    if (drm->connector) {
+        drmModeFreeConnector(drm->connector);
+        drm->connector = NULL;
     }
-    if (kms->encoder) {
-        drmModeFreeEncoder(kms->encoder);
-        kms->encoder = NULL;
+    if (drm->encoder) {
+        drmModeFreeEncoder(drm->encoder);
+        drm->encoder = NULL;
     }
-    if (kms->atomic_context) {
-       drm_atomic_destroy_context(kms->atomic_context);
+    if (drm->atomic_context) {
+        drm_atomic_destroy_context(drm->atomic_context);
     }
 
-    close(kms->fd);
-    talloc_free(kms);
+    close(drm->fd);
+    talloc_free(drm);
+    vo->drm = NULL;
 }
 
 static double mode_get_Hz(const drmModeModeInfo *mode)
@@ -641,8 +1079,8 @@ static double mode_get_Hz(const drmModeModeInfo *mode)
     return rate;
 }
 
-static void kms_show_available_modes(
-    struct mp_log *log, const drmModeConnector *connector)
+static void drm_show_available_modes(struct mp_log *log,
+                                     const drmModeConnector *connector)
 {
     for (unsigned int i = 0; i < connector->count_modes; i++) {
         mp_info(log, "  Mode %d: %s (%dx%d@%.2fHz)\n", i,
@@ -653,13 +1091,14 @@ static void kms_show_available_modes(
     }
 }
 
-static void kms_show_foreach_connector(struct mp_log *log, int card_no,
+static void drm_show_foreach_connector(struct mp_log *log, int card_no,
+                                       const char *card_path,
                                        void (*show_fn)(struct mp_log*, int,
                                                        const drmModeConnector*))
 {
-    int fd = open_card(card_no);
+    int fd = open_card_path(card_path);
     if (fd < 0) {
-        mp_err(log, "Failed to open card %d\n", card_no);
+        mp_err(log, "Failed to open card %d (%s)\n", card_no, card_path);
         return;
     }
 
@@ -670,8 +1109,7 @@ static void kms_show_foreach_connector(struct mp_log *log, int card_no,
     }
 
     for (int i = 0; i < res->count_connectors; i++) {
-        drmModeConnector *connector
-            = drmModeGetConnector(fd, res->connectors[i]);
+        drmModeConnector *connector = drmModeGetConnector(fd, res->connectors[i]);
         if (!connector)
             continue;
         show_fn(log, card_no, connector);
@@ -685,25 +1123,27 @@ err:
         drmModeFreeResources(res);
 }
 
-static void kms_show_connector_name_and_state_callback(
-    struct mp_log *log, int card_no, const drmModeConnector *connector)
+static void drm_show_connector_name_and_state_callback(struct mp_log *log, int card_no,
+                                                       const drmModeConnector *connector)
 {
     char other_connector_name[MAX_CONNECTOR_NAME_LEN];
     get_connector_name(connector, other_connector_name);
-    const char *connection_str =
-        (connector->connection == DRM_MODE_CONNECTED) ? "connected" : "disconnected";
+    const char *connection_str = (connector->connection == DRM_MODE_CONNECTED) ?
+                                 "connected" : "disconnected";
     mp_info(log, "  %s (%s)\n", other_connector_name, connection_str);
 }
 
-static void kms_show_available_connectors(struct mp_log *log, int card_no)
+static void drm_show_available_connectors(struct mp_log *log, int card_no,
+                                          const char *card_path)
 {
-    mp_info(log, "Available connectors for card %d:\n", card_no);
-    kms_show_foreach_connector(
-        log, card_no, kms_show_connector_name_and_state_callback);
+    mp_info(log, "Available connectors for card %d (%s):\n", card_no,
+            card_path);
+    drm_show_foreach_connector(log, card_no, card_path,
+                               drm_show_connector_name_and_state_callback);
     mp_info(log, "\n");
 }
 
-static void kms_show_connector_modes_callback(struct mp_log *log, int card_no,
+static void drm_show_connector_modes_callback(struct mp_log *log, int card_no,
                                               const drmModeConnector *connector)
 {
     if (connector->connection != DRM_MODE_CONNECTED)
@@ -713,53 +1153,73 @@ static void kms_show_connector_modes_callback(struct mp_log *log, int card_no,
     get_connector_name(connector, other_connector_name);
     mp_info(log, "Available modes for drm-connector=%d.%s\n",
             card_no, other_connector_name);
-    kms_show_available_modes(log, connector);
+    drm_show_available_modes(log, connector);
     mp_info(log, "\n");
 }
 
-static void kms_show_available_connectors_and_modes(struct mp_log *log, int card_no)
+static void drm_show_available_connectors_and_modes(struct mp_log *log,
+                                                    int card_no,
+                                                    const char *card_path)
 {
-    kms_show_foreach_connector(log, card_no, kms_show_connector_modes_callback);
+    drm_show_foreach_connector(log, card_no, card_path,
+                               drm_show_connector_modes_callback);
 }
 
-static void kms_show_foreach_card(
-    struct mp_log *log, void (*show_fn)(struct mp_log*,int))
+static void drm_show_foreach_card(struct mp_log *log,
+                                  void (*show_fn)(struct mp_log *, int,
+                                                  const char *))
 {
-    for (int card_no = 0; card_no < DRM_MAX_MINOR; card_no++) {
-        int fd = open_card(card_no);
-        if (fd < 0)
-            break;
-        close(fd);
-        show_fn(log, card_no);
+    drmDevice *devices[DRM_MAX_MINOR] = { 0 };
+    int card_count = drmGetDevices2(0, devices, MP_ARRAY_SIZE(devices));
+    if (card_count < 0) {
+        mp_err(log, "Listing DRM devices with drmGetDevices failed! (%s)\n",
+               mp_strerror(errno));
+        return;
     }
+
+    for (int i = 0; i < card_count; i++) {
+        drmDevice *dev = devices[i];
+
+        if (!(dev->available_nodes & (1 << DRM_NODE_PRIMARY)))
+            continue;
+
+        const char *card_path = dev->nodes[DRM_NODE_PRIMARY];
+
+        int fd = open_card_path(card_path);
+        if (fd < 0) {
+            mp_err(log, "Failed to open primary DRM node path %s!\n",
+                   card_path);
+            continue;
+        }
+
+        close(fd);
+        show_fn(log, i, card_path);
+    }
+
+    drmFreeDevices(devices, card_count);
 }
 
-static void kms_show_available_cards_and_connectors(struct mp_log *log)
+static void drm_show_available_cards_and_connectors(struct mp_log *log)
 {
-    kms_show_foreach_card(log, kms_show_available_connectors);
+    drm_show_foreach_card(log, drm_show_available_connectors);
 }
 
-static void kms_show_available_cards_connectors_and_modes(struct mp_log *log)
+static void drm_show_available_cards_connectors_and_modes(struct mp_log *log)
 {
-    kms_show_foreach_card(log, kms_show_available_connectors_and_modes);
-}
-
-double kms_get_display_fps(const struct kms *kms)
-{
-    return mode_get_Hz(&kms->mode.mode);
+    drm_show_foreach_card(log, drm_show_available_connectors_and_modes);
 }
 
 static int drm_connector_opt_help(struct mp_log *log, const struct m_option *opt,
                                   struct bstr name)
 {
-    kms_show_available_cards_and_connectors(log);
+    drm_show_available_cards_and_connectors(log);
     return M_OPT_EXIT;
 }
 
 static int drm_mode_opt_help(struct mp_log *log, const struct m_option *opt,
                              struct bstr name)
 {
-    kms_show_available_cards_connectors_and_modes(log);
+    drm_show_available_cards_connectors_and_modes(log);
     return M_OPT_EXIT;
 }
 
@@ -775,215 +1235,56 @@ static int drm_validate_mode_opt(struct mp_log *log, const struct m_option *opt,
     return 1;
 }
 
-// VT switcher ----------------------------------------------------------------
-
-static void vt_switcher_sighandler(int sig)
+/* Helpers */
+double vo_drm_get_display_fps(struct vo_drm_state *drm)
 {
-    unsigned char event = sig == RELEASE_SIGNAL ? EVT_RELEASE : EVT_ACQUIRE;
-    (void)write(vt_switcher_pipe[1], &event, sizeof(event));
+    return mode_get_Hz(&drm->mode.mode);
 }
 
-static bool has_signal_installed(int signo)
+void vo_drm_set_monitor_par(struct vo *vo)
 {
-    struct sigaction act = { 0 };
-    sigaction(signo, 0, &act);
-    return act.sa_handler != 0;
+    struct vo_drm_state *drm = vo->drm;
+    if (vo->opts->force_monitor_aspect != 0.0) {
+        vo->monitor_par = drm->fb->width / (double) drm->fb->height /
+                          vo->opts->force_monitor_aspect;
+    } else {
+        vo->monitor_par = 1 / vo->opts->monitor_pixel_aspect;
+    }
+    MP_VERBOSE(drm, "Monitor pixel aspect: %g\n", vo->monitor_par);
 }
 
-static int install_signal(int signo, void (*handler)(int))
+void vo_drm_wait_events(struct vo *vo, int64_t until_time_ns)
 {
-    struct sigaction act = { 0 };
-    act.sa_handler = handler;
-    sigemptyset(&act.sa_mask);
-    act.sa_flags = SA_RESTART;
-    return sigaction(signo, &act, NULL);
+    struct vo_drm_state *drm = vo->drm;
+    if (drm->vt_switcher_active) {
+        int64_t wait_ns = until_time_ns - mp_time_ns();
+        int64_t timeout_ns = MPCLAMP(wait_ns, 0, MP_TIME_S_TO_NS(10));
+        vt_switcher_poll(&drm->vt_switcher, timeout_ns);
+    } else {
+        vo_wait_default(vo, until_time_ns);
+    }
 }
 
-bool vt_switcher_init(struct vt_switcher *s, struct mp_log *log)
+void vo_drm_wait_on_flip(struct vo_drm_state *drm)
 {
-    s->log = log;
-    s->tty_fd = -1;
-    vt_switcher_pipe[0] = -1;
-    vt_switcher_pipe[1] = -1;
-
-    if (mp_make_cloexec_pipe(vt_switcher_pipe)) {
-        MP_ERR(s, "Creating pipe failed: %s\n", mp_strerror(errno));
-        return false;
-    }
-
-    s->tty_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
-    if (s->tty_fd < 0) {
-        MP_ERR(s, "Can't open TTY for VT control: %s\n", mp_strerror(errno));
-        return false;
-    }
-
-    if (has_signal_installed(RELEASE_SIGNAL)) {
-        MP_ERR(s, "Can't handle VT release - signal already used\n");
-        return false;
-    }
-    if (has_signal_installed(ACQUIRE_SIGNAL)) {
-        MP_ERR(s, "Can't handle VT acquire - signal already used\n");
-        return false;
-    }
-
-    if (install_signal(RELEASE_SIGNAL, vt_switcher_sighandler)) {
-        MP_ERR(s, "Failed to install release signal: %s\n", mp_strerror(errno));
-        return false;
-    }
-    if (install_signal(ACQUIRE_SIGNAL, vt_switcher_sighandler)) {
-        MP_ERR(s, "Failed to install acquire signal: %s\n", mp_strerror(errno));
-        return false;
-    }
-
-    struct vt_mode vt_mode = { 0 };
-    if (ioctl(s->tty_fd, VT_GETMODE, &vt_mode) < 0) {
-        MP_ERR(s, "VT_GETMODE failed: %s\n", mp_strerror(errno));
-        return false;
-    }
-
-    vt_mode.mode = VT_PROCESS;
-    vt_mode.relsig = RELEASE_SIGNAL;
-    vt_mode.acqsig = ACQUIRE_SIGNAL;
-    // frsig is a signal for forced release. Not implemented on Linux,
-    // Solaris, BSDs but must be set to a valid signal on some of those.
-    vt_mode.frsig = SIGIO; // unused
-    if (ioctl(s->tty_fd, VT_SETMODE, &vt_mode) < 0) {
-        MP_ERR(s, "VT_SETMODE failed: %s\n", mp_strerror(errno));
-        return false;
-    }
-
-    // Block the VT switching signals from interrupting the VO thread (they will
-    // still be picked up by other threads, which will fill vt_switcher_pipe for us)
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, RELEASE_SIGNAL);
-    sigaddset(&set, ACQUIRE_SIGNAL);
-    pthread_sigmask(SIG_BLOCK, &set, NULL);
-
-    return true;
-}
-
-void vt_switcher_acquire(struct vt_switcher *s,
-                         void (*handler)(void*), void *user_data)
-{
-    s->handlers[HANDLER_ACQUIRE] = handler;
-    s->handler_data[HANDLER_ACQUIRE] = user_data;
-}
-
-void vt_switcher_release(struct vt_switcher *s,
-                         void (*handler)(void*), void *user_data)
-{
-    s->handlers[HANDLER_RELEASE] = handler;
-    s->handler_data[HANDLER_RELEASE] = user_data;
-}
-
-void vt_switcher_interrupt_poll(struct vt_switcher *s)
-{
-    unsigned char event = EVT_INTERRUPT;
-    (void)write(vt_switcher_pipe[1], &event, sizeof(event));
-}
-
-void vt_switcher_destroy(struct vt_switcher *s)
-{
-    struct vt_mode vt_mode = {0};
-    vt_mode.mode = VT_AUTO;
-    if (ioctl(s->tty_fd, VT_SETMODE, &vt_mode) < 0) {
-        MP_ERR(s, "VT_SETMODE failed: %s\n", mp_strerror(errno));
-        return;
-    }
-
-    install_signal(RELEASE_SIGNAL, SIG_DFL);
-    install_signal(ACQUIRE_SIGNAL, SIG_DFL);
-    close(s->tty_fd);
-    close(vt_switcher_pipe[0]);
-    close(vt_switcher_pipe[1]);
-}
-
-void vt_switcher_poll(struct vt_switcher *s, int timeout_ms)
-{
-    struct pollfd fds[1] = {
-        { .events = POLLIN, .fd = vt_switcher_pipe[0] },
-    };
-    poll(fds, 1, timeout_ms);
-    if (!fds[0].revents)
-        return;
-
-    unsigned char event;
-    if (read(fds[0].fd, &event, sizeof(event)) != sizeof(event))
-        return;
-
-    switch (event) {
-    case EVT_RELEASE:
-        s->handlers[HANDLER_RELEASE](s->handler_data[HANDLER_RELEASE]);
-
-        if (ioctl(s->tty_fd, VT_RELDISP, 1) < 0) {
-            MP_ERR(s, "Failed to release virtual terminal\n");
+    // poll page flip finish event
+    while (drm->waiting_for_flip) {
+        const int timeout_ms = 3000;
+        struct pollfd fds[1] = { { .events = POLLIN, .fd = drm->fd } };
+        poll(fds, 1, timeout_ms);
+        if (fds[0].revents & POLLIN) {
+            const int ret = drmHandleEvent(drm->fd, &drm->ev);
+            if (ret != 0) {
+                MP_ERR(drm, "drmHandleEvent failed: %i\n", ret);
+                return;
+            }
         }
-        break;
-
-    case EVT_ACQUIRE:
-        s->handlers[HANDLER_ACQUIRE](s->handler_data[HANDLER_ACQUIRE]);
-
-        if (ioctl(s->tty_fd, VT_RELDISP, VT_ACKACQ) < 0) {
-            MP_ERR(s, "Failed to acquire virtual terminal\n");
-        }
-        break;
-
-    case EVT_INTERRUPT:
-        break;
     }
 }
 
-void drm_pflip_cb(int fd, unsigned int msc, unsigned int sec,
-                  unsigned int usec, void *data)
+void vo_drm_wakeup(struct vo *vo)
 {
-    struct drm_pflip_cb_closure *closure = data;
-
-    struct drm_vsync_tuple *vsync = closure->vsync;
-    // frame_vsync->ust is the timestamp of the pageflip that happened just before this flip was queued
-    // frame_vsync->msc is the sequence number of the pageflip that happened just before this flip was queued
-    // frame_vsync->sbc is the sequence number for the frame that was just flipped to screen
-    struct drm_vsync_tuple *frame_vsync = closure->frame_vsync;
-    struct vo_vsync_info *vsync_info = closure->vsync_info;
-
-    const bool ready =
-        (vsync->msc != 0) &&
-        (frame_vsync->ust != 0) && (frame_vsync->msc != 0);
-
-    const uint64_t ust = (sec * 1000000LL) + usec;
-
-    const unsigned int msc_since_last_flip = msc - vsync->msc;
-    if (ready && msc == vsync->msc) {
-        // Seems like some drivers only increment msc every other page flip when
-        // running in interlaced mode (I'm looking at you nouveau). Obviously we
-        // can't work with this, so shame the driver and bail.
-        mp_err(closure->log,
-               "Got the same msc value twice: (msc: %u, vsync->msc: %u). This shouldn't happen. Possibly broken driver/interlaced mode?\n",
-               msc, vsync->msc);
-        goto fail;
-    }
-
-    vsync->ust = ust;
-    vsync->msc = msc;
-
-    if (ready) {
-        // Convert to mp_time
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts))
-            goto fail;
-        const uint64_t now_monotonic = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-        const uint64_t ust_mp_time = mp_time_us() - (now_monotonic - vsync->ust);
-
-        const uint64_t     ust_since_enqueue = vsync->ust - frame_vsync->ust;
-        const unsigned int msc_since_enqueue = vsync->msc - frame_vsync->msc;
-        const unsigned int sbc_since_enqueue = vsync->sbc - frame_vsync->sbc;
-
-        vsync_info->vsync_duration = ust_since_enqueue / msc_since_enqueue;
-        vsync_info->skipped_vsyncs = msc_since_last_flip - 1; // Valid iff swap_buffers is called every vsync
-        vsync_info->last_queue_display_time = ust_mp_time + (sbc_since_enqueue * vsync_info->vsync_duration);
-    }
-
-fail:
-    *closure->waiting_for_flip = false;
-    talloc_free(closure);
+    struct vo_drm_state *drm = vo->drm;
+    if (drm->vt_switcher_active)
+        vt_switcher_interrupt_poll(&drm->vt_switcher);
 }

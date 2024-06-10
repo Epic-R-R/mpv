@@ -2,14 +2,40 @@
 #define MPGL_HWDEC_H_
 
 #include "video/mp_image.h"
+#include "context.h"
 #include "ra.h"
 #include "video/hwdec.h"
+
+// Helper to organize/load hwdecs dynamically
+struct ra_hwdec_ctx {
+    // Set these before calling `ra_hwdec_ctx_init`
+    struct mp_log *log;
+    struct mpv_global *global;
+    struct ra_ctx *ra_ctx;
+
+    bool loading_done;
+    struct ra_hwdec **hwdecs;
+    int num_hwdecs;
+};
+
+OPT_STRING_VALIDATE_FUNC(ra_hwdec_validate_opt);
+OPT_STRING_VALIDATE_FUNC(ra_hwdec_validate_drivers_only_opt);
+
+void ra_hwdec_ctx_init(struct ra_hwdec_ctx *ctx, struct mp_hwdec_devices *devs,
+                       const char *opt, bool load_all_by_default);
+void ra_hwdec_ctx_uninit(struct ra_hwdec_ctx *ctx);
+
+void ra_hwdec_ctx_load_fmt(struct ra_hwdec_ctx *ctx, struct mp_hwdec_devices *devs,
+                           struct hwdec_imgfmt_request *params);
+
+// Gets the right `ra_hwdec` for a format, if any
+struct ra_hwdec *ra_hwdec_get(struct ra_hwdec_ctx *ctx, int imgfmt);
 
 struct ra_hwdec {
     const struct ra_hwdec_driver *driver;
     struct mp_log *log;
     struct mpv_global *global;
-    struct ra *ra;
+    struct ra_ctx *ra_ctx;
     struct mp_hwdec_devices *devs;
     // GLSL extensions required to sample textures from this.
     const char **glsl_extensions;
@@ -57,7 +83,7 @@ struct ra_hwdec_mapper_driver {
     void (*uninit)(struct ra_hwdec_mapper *mapper);
 
     // Map mapper->src as texture, and set mapper->frame to textures using it.
-    // It is expected that that the textures remain valid until the next unmap
+    // It is expected that the textures remain valid until the next unmap
     // or uninit call.
     // The function is allowed to unref mapper->src if it's not needed (i.e.
     // this function creates a copy).
@@ -102,23 +128,25 @@ struct ra_hwdec_driver {
 
 extern const struct ra_hwdec_driver *const ra_hwdec_drivers[];
 
-struct ra_hwdec *ra_hwdec_load_driver(struct ra *ra, struct mp_log *log,
+struct ra_hwdec *ra_hwdec_load_driver(struct ra_ctx *ra_ctx,
+                                      struct mp_log *log,
                                       struct mpv_global *global,
                                       struct mp_hwdec_devices *devs,
                                       const struct ra_hwdec_driver *drv,
                                       bool is_auto);
-
-int ra_hwdec_validate_opt(struct mp_log *log, const m_option_t *opt,
-                          struct bstr name, const char **value);
 
 void ra_hwdec_uninit(struct ra_hwdec *hwdec);
 
 bool ra_hwdec_test_format(struct ra_hwdec *hwdec, int imgfmt);
 
 struct ra_hwdec_mapper *ra_hwdec_mapper_create(struct ra_hwdec *hwdec,
-                                               struct mp_image_params *params);
+                                               const struct mp_image_params *params);
 void ra_hwdec_mapper_free(struct ra_hwdec_mapper **mapper);
 void ra_hwdec_mapper_unmap(struct ra_hwdec_mapper *mapper);
 int ra_hwdec_mapper_map(struct ra_hwdec_mapper *mapper, struct mp_image *img);
+
+// Get the primary image format for the given driver name.
+// Returns IMGFMT_NONE if the name doesn't get matched.
+int ra_hwdec_driver_get_imgfmt_for_name(const char *name);
 
 #endif

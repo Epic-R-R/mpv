@@ -21,13 +21,13 @@
 #include <assert.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/intreadwrite.h>
-
-#include "config.h"
 
 #include "common/av_common.h"
 #include "common/common.h"
 #include "demux.h"
+#include "demux/ebml.h"
 
 #include "packet.h"
 
@@ -39,9 +39,7 @@ void demux_packet_unref_contents(struct demux_packet *dp)
 {
     if (dp->avpacket) {
         assert(!dp->is_cached);
-        av_packet_unref(dp->avpacket);
-        talloc_free(dp->avpacket);
-        dp->avpacket = NULL;
+        av_packet_free(&dp->avpacket);
         dp->buffer = NULL;
         dp->len = 0;
     }
@@ -53,13 +51,8 @@ static void packet_destroy(void *ptr)
     demux_packet_unref_contents(dp);
 }
 
-// This actually preserves only data and side data, not PTS/DTS/pos/etc.
-// It also allows avpkt->data==NULL with avpkt->size!=0 - the libavcodec API
-// does not allow it, but we do it to simplify new_demux_packet().
-struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
+static struct demux_packet *packet_create(void)
 {
-    if (avpkt->size > 1000000000)
-        return NULL;
     struct demux_packet *dp = talloc(NULL, struct demux_packet);
     talloc_set_destructor(dp, packet_destroy);
     *dp = (struct demux_packet) {
@@ -70,9 +63,21 @@ struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
         .start = MP_NOPTS_VALUE,
         .end = MP_NOPTS_VALUE,
         .stream = -1,
-        .avpacket = talloc_zero(dp, AVPacket),
+        .avpacket = av_packet_alloc(),
+        .animated = -1,
     };
-    av_init_packet(dp->avpacket);
+    MP_HANDLE_OOM(dp->avpacket);
+    return dp;
+}
+
+// This actually preserves only data and side data, not PTS/DTS/pos/etc.
+// It also allows avpkt->data==NULL with avpkt->size!=0 - the libavcodec API
+// does not allow it, but we do it to simplify new_demux_packet().
+struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
+{
+    if (avpkt->size > 1000000000)
+        return NULL;
+    struct demux_packet *dp = packet_create();
     int r = -1;
     if (avpkt->data) {
         // We hope that this function won't need/access AVPacket input padding,
@@ -82,7 +87,6 @@ struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
         r = av_new_packet(dp->avpacket, avpkt->size);
     }
     if (r < 0) {
-        *dp->avpacket = (AVPacket){0};
         talloc_free(dp);
         return NULL;
     }
@@ -96,29 +100,44 @@ struct demux_packet *new_demux_packet_from_buf(struct AVBufferRef *buf)
 {
     if (!buf)
         return NULL;
-    AVPacket pkt = {
-        .size = buf->size,
-        .data = buf->data,
-        .buf = buf,
-    };
-    return new_demux_packet_from_avpacket(&pkt);
+    if (buf->size > 1000000000)
+        return NULL;
+
+    struct demux_packet *dp = packet_create();
+    dp->avpacket->buf = av_buffer_ref(buf);
+    if (!dp->avpacket->buf) {
+        talloc_free(dp);
+        return NULL;
+    }
+    dp->avpacket->data = dp->buffer = buf->data;
+    dp->avpacket->size = dp->len = buf->size;
+    return dp;
 }
 
 // Input data doesn't need to be padded.
 struct demux_packet *new_demux_packet_from(void *data, size_t len)
 {
-    if (len > INT_MAX)
+    struct demux_packet *dp = new_demux_packet(len);
+    if (!dp)
         return NULL;
-    AVPacket pkt = { .data = data, .size = len };
-    return new_demux_packet_from_avpacket(&pkt);
+    memcpy(dp->avpacket->data, data, len);
+    return dp;
 }
 
 struct demux_packet *new_demux_packet(size_t len)
 {
     if (len > INT_MAX)
         return NULL;
-    AVPacket pkt = { .data = NULL, .size = len };
-    return new_demux_packet_from_avpacket(&pkt);
+
+    struct demux_packet *dp = packet_create();
+    int r = av_new_packet(dp->avpacket, len);
+    if (r < 0) {
+        talloc_free(dp);
+        return NULL;
+    }
+    dp->buffer = dp->avpacket->data;
+    dp->len = len;
+    return dp;
 }
 
 void demux_packet_shorten(struct demux_packet *dp, size_t len)
@@ -216,9 +235,57 @@ int demux_packet_add_blockadditional(struct demux_packet *dp, uint64_t id,
 {
     if (!dp->avpacket)
         return -1;
-    uint8_t *sd =  av_packet_new_side_data(dp->avpacket,
-                                           AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
-                                           8 + size);
+
+    switch (id) {
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 5, 100)
+    case MATROSKA_BLOCK_ADD_ID_TYPE_ITU_T_T35: {
+        static const uint8_t ITU_T_T35_COUNTRY_CODE_US = 0xB5;
+        static const uint16_t ITU_T_T35_PROVIDER_CODE_SMTPE = 0x3C;
+
+        if (size < 6)
+            break;
+
+        uint8_t *p = data;
+
+        uint8_t country_code = AV_RB8(p);
+        p += sizeof(country_code);
+        uint16_t provider_code = AV_RB16(p);
+        p += sizeof(provider_code);
+
+        if (country_code != ITU_T_T35_COUNTRY_CODE_US ||
+            provider_code != ITU_T_T35_PROVIDER_CODE_SMTPE)
+            break;
+
+        uint16_t provider_oriented_code = AV_RB16(p);
+        p += sizeof(provider_oriented_code);
+        uint8_t application_identifier = AV_RB8(p);
+        p += sizeof(application_identifier);
+
+        if (provider_oriented_code != 1 || application_identifier != 4)
+            break;
+
+        size_t hdrplus_size;
+        AVDynamicHDRPlus *hdrplus = av_dynamic_hdr_plus_alloc(&hdrplus_size);
+        MP_HANDLE_OOM(hdrplus);
+
+        if (av_dynamic_hdr_plus_from_t35(hdrplus, p, size - (p - (uint8_t *)data)) < 0 ||
+            av_packet_add_side_data(dp->avpacket, AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+                                    (uint8_t *)hdrplus, hdrplus_size) < 0)
+        {
+            av_free(hdrplus);
+            return -1;
+        }
+
+        return 0;
+    }
+#endif
+    default:
+        break;
+    }
+
+    uint8_t *sd = av_packet_new_side_data(dp->avpacket,
+                                          AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+                                          8 + size);
     if (!sd)
         return -1;
     AV_WB64(sd, id);

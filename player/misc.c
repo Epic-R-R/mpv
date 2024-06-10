@@ -15,12 +15,12 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stddef.h>
-#include <stdbool.h>
-#include <errno.h>
 #include <assert.h>
+#include <errno.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stddef.h>
 
-#include "config.h"
 #include "mpv_talloc.h"
 
 #include "osdep/io.h"
@@ -148,7 +148,12 @@ double get_track_seek_offset(struct MPContext *mpctx, struct track *track)
         if (track->type == STREAM_AUDIO)
             return -opts->audio_delay;
         if (track->type == STREAM_SUB)
-            return -opts->subs_rend->sub_delay;
+        {
+            for (int n = 0; n < num_ptracks[STREAM_SUB]; n++) {
+                if (mpctx->current_track[n][STREAM_SUB] == track)
+                    return -opts->subs_shared->sub_delay[n];
+            }
+        }
     }
     return 0;
 }
@@ -169,21 +174,36 @@ void issue_refresh_seek(struct MPContext *mpctx, enum seek_precision min_prec)
     queue_seek(mpctx, MPSEEK_ABSOLUTE, get_current_time(mpctx), min_prec, 0);
 }
 
+void update_content_type(struct MPContext *mpctx, struct track *track)
+{
+    enum mp_content_type content_type;
+    if (!track || !track->vo_c) {
+        content_type = MP_CONTENT_NONE;
+    } else if (track->image) {
+        content_type = MP_CONTENT_IMAGE;
+    } else {
+        content_type = MP_CONTENT_VIDEO;
+    }
+    if (mpctx->video_out)
+        vo_control(mpctx->video_out, VOCTRL_CONTENT_TYPE, &content_type);
+}
+
 void update_vo_playback_state(struct MPContext *mpctx)
 {
     if (mpctx->video_out && mpctx->video_out->config_ok) {
         struct voctrl_playback_state oldstate = mpctx->vo_playback_state;
+        double pos = get_current_pos_ratio(mpctx, false);
         struct voctrl_playback_state newstate = {
-            .taskbar_progress = mpctx->opts->vo->taskbar_progress,
+            .taskbar_progress = mpctx->opts->vo->taskbar_progress && pos >= 0,
             .playing = mpctx->playing,
             .paused = mpctx->paused,
-            .percent_pos = get_percent_pos(mpctx),
+            .position = pos > 0 ? lrint(pos * UINT8_MAX) : 0,
         };
 
         if (oldstate.taskbar_progress != newstate.taskbar_progress ||
             oldstate.playing != newstate.playing ||
             oldstate.paused != newstate.paused ||
-            oldstate.percent_pos != newstate.percent_pos)
+            oldstate.position != newstate.position)
         {
             // Don't update progress bar if it was and still is hidden
             if ((oldstate.playing && oldstate.taskbar_progress) ||
@@ -234,7 +254,8 @@ void error_on_track(struct MPContext *mpctx, struct track *track)
     if (track->type == STREAM_VIDEO)
         MP_INFO(mpctx, "Video: no video\n");
     if (mpctx->opts->stop_playback_on_init_failure ||
-        !(mpctx->vo_chain || mpctx->ao_chain))
+        (!mpctx->current_track[0][STREAM_AUDIO] &&
+         !mpctx->current_track[0][STREAM_VIDEO]))
     {
         if (!mpctx->stop_play)
             mpctx->stop_play = PT_ERROR;
@@ -247,21 +268,23 @@ void error_on_track(struct MPContext *mpctx, struct track *track)
 int stream_dump(struct MPContext *mpctx, const char *source_filename)
 {
     struct MPOpts *opts = mpctx->opts;
+    bool ok = false;
+
     stream_t *stream = stream_create(source_filename,
                                      STREAM_ORIGIN_DIRECT | STREAM_READ,
                                      mpctx->playback_abort, mpctx->global);
-    if (!stream)
-        return -1;
+    if (!stream || stream->is_directory)
+        goto done;
 
     int64_t size = stream_get_size(stream);
 
     FILE *dest = fopen(opts->stream_dump, "wb");
     if (!dest) {
         MP_ERR(mpctx, "Error opening dump file: %s\n", mp_strerror(errno));
-        return -1;
+        goto done;
     }
 
-    bool ok = true;
+    ok = true;
 
     while (mpctx->stop_play == KEEP_PLAYING && ok) {
         if (!opts->quiet && ((stream->pos / (1024 * 1024)) % 2) == 1) {
@@ -281,6 +304,7 @@ int stream_dump(struct MPContext *mpctx, const char *source_filename)
     }
 
     ok &= fclose(dest) == 0;
+done:
     free_stream(stream);
     return ok ? 0 : -1;
 }
@@ -304,7 +328,7 @@ void merge_playlist_files(struct playlist *pl)
         edl = talloc_strdup_append_buffer(edl, e->filename);
     }
     playlist_clear(pl);
-    playlist_add_file(pl, edl);
+    playlist_append_file(pl, edl);
     talloc_free(edl);
 }
 

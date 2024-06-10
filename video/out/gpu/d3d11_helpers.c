@@ -19,12 +19,12 @@
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <versionhelpers.h>
-#include <pthread.h>
 
 #include "common/common.h"
 #include "common/msg.h"
 #include "misc/bstr.h"
 #include "osdep/io.h"
+#include "osdep/threads.h"
 #include "osdep/windows_utils.h"
 
 #include "d3d11_helpers.h"
@@ -32,14 +32,17 @@
 // Windows 8 enum value, not present in mingw-w64 headers
 #define DXGI_ADAPTER_FLAG_SOFTWARE (2)
 typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY)(REFIID riid, void **ppFactory);
+typedef HRESULT(WINAPI *PFN_DXGI_GET_DEBUG_INTERFACE)(REFIID riid, void **ppDebug);
 
-static pthread_once_t d3d11_once = PTHREAD_ONCE_INIT;
+static mp_once d3d11_once = MP_STATIC_ONCE_INITIALIZER;
 static PFN_D3D11_CREATE_DEVICE pD3D11CreateDevice = NULL;
 static PFN_CREATE_DXGI_FACTORY pCreateDXGIFactory1 = NULL;
+static PFN_DXGI_GET_DEBUG_INTERFACE pDXGIGetDebugInterface = NULL;
 static void d3d11_load(void)
 {
     HMODULE d3d11   = LoadLibraryW(L"d3d11.dll");
     HMODULE dxgilib = LoadLibraryW(L"dxgi.dll");
+    HMODULE dxgidebuglib = LoadLibraryW(L"dxgidebug.dll");
     if (!d3d11 || !dxgilib)
         return;
 
@@ -47,11 +50,15 @@ static void d3d11_load(void)
         GetProcAddress(d3d11, "D3D11CreateDevice");
     pCreateDXGIFactory1 = (PFN_CREATE_DXGI_FACTORY)
         GetProcAddress(dxgilib, "CreateDXGIFactory1");
+    if (dxgidebuglib) {
+        pDXGIGetDebugInterface = (PFN_DXGI_GET_DEBUG_INTERFACE)
+            GetProcAddress(dxgidebuglib, "DXGIGetDebugInterface");
+    }
 }
 
 static bool load_d3d11_functions(struct mp_log *log)
 {
-    pthread_once(&d3d11_once, d3d11_load);
+    mp_exec_once(&d3d11_once, d3d11_load);
     if (!pD3D11CreateDevice || !pCreateDXGIFactory1) {
         mp_fatal(log, "Failed to load base d3d11 functionality: "
                       "CreateDevice: %s, CreateDXGIFactory1: %s\n",
@@ -228,9 +235,9 @@ static const char *d3d11_get_csp_name(DXGI_COLOR_SPACE_TYPE csp)
 }
 
 static bool d3d11_get_mp_csp(DXGI_COLOR_SPACE_TYPE csp,
-                             struct mp_colorspace *mp_csp)
+                             struct pl_color_space *pl_color_system)
 {
-    if (!mp_csp)
+    if (!pl_color_system)
         return false;
 
     // Colorspaces utilizing gamma 2.2 (G22) are set to
@@ -243,27 +250,27 @@ static bool d3d11_get_mp_csp(DXGI_COLOR_SPACE_TYPE csp,
     // regarding not doing conversion from BT.601 to BT.709.
     switch (csp) {
     case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
-        *mp_csp = (struct mp_colorspace){
-            .gamma     = MP_CSP_TRC_AUTO,
-            .primaries = MP_CSP_PRIM_AUTO,
+        *pl_color_system = (struct pl_color_space){
+            .transfer  = PL_COLOR_TRC_UNKNOWN,
+            .primaries = PL_COLOR_PRIM_UNKNOWN,
         };
         break;
     case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
-        *mp_csp = (struct mp_colorspace) {
-            .gamma     = MP_CSP_TRC_LINEAR,
-            .primaries = MP_CSP_PRIM_AUTO,
+        *pl_color_system = (struct pl_color_space) {
+            .transfer  = PL_COLOR_TRC_LINEAR,
+            .primaries = PL_COLOR_PRIM_UNKNOWN,
         };
         break;
     case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
-        *mp_csp = (struct mp_colorspace) {
-            .gamma     = MP_CSP_TRC_PQ,
-            .primaries = MP_CSP_PRIM_BT_2020,
+        *pl_color_system = (struct pl_color_space) {
+            .transfer  = PL_COLOR_TRC_PQ,
+            .primaries = PL_COLOR_PRIM_BT_2020,
         };
         break;
     case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020:
-        *mp_csp = (struct mp_colorspace) {
-            .gamma     = MP_CSP_TRC_AUTO,
-            .primaries = MP_CSP_PRIM_BT_2020,
+        *pl_color_system = (struct pl_color_space) {
+            .transfer  = PL_COLOR_TRC_UNKNOWN,
+            .primaries = PL_COLOR_PRIM_BT_2020,
         };
         break;
     default:
@@ -287,28 +294,8 @@ static bool query_output_format_and_colorspace(struct mp_log *log,
     if (!out_fmt || !out_cspace)
         return false;
 
-    HRESULT hr = IDXGISwapChain_GetContainingOutput(swapchain, &output);
-    if (FAILED(hr)) {
-        mp_err(log, "Failed to get swap chain's containing output: %s!\n",
-               mp_HRESULT_to_str(hr));
-        goto done;
-    }
-
-    hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6,
-                                    (void**)&output6);
-    if (FAILED(hr)) {
-        // point where systems older than Windows 10 would fail,
-        // thus utilizing error log level only with windows 10+
-        mp_msg(log, IsWindows10OrGreater() ? MSGL_ERR : MSGL_V,
-               "Failed to create a DXGI 1.6 output interface: %s\n",
-               mp_HRESULT_to_str(hr));
-        goto done;
-    }
-
-    hr = IDXGIOutput6_GetDesc1(output6, &desc);
-    if (FAILED(hr)) {
-        mp_err(log, "Failed to query swap chain's output information: %s\n",
-               mp_HRESULT_to_str(hr));
+    if (!mp_get_dxgi_output_desc(swapchain, &desc)) {
+        mp_err(log, "Failed to query swap chain's output information\n");
         goto done;
     }
 
@@ -371,9 +358,9 @@ static int get_feature_levels(int max_fl, int min_fl,
     return len;
 }
 
-static IDXGIAdapter1 *get_d3d11_adapter(struct mp_log *log,
-                                        struct bstr requested_adapter_name,
-                                        struct bstr *listing)
+IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
+                                   bstr requested_adapter_name,
+                                   bstr *listing)
 {
     HRESULT hr = S_OK;
     IDXGIFactory1 *factory;
@@ -437,6 +424,37 @@ static IDXGIAdapter1 *get_d3d11_adapter(struct mp_log *log,
     return picked_adapter;
 }
 
+int mp_dxgi_validate_adapter(struct mp_log *log,
+                             const struct m_option *opt,
+                             struct bstr name, const char **value)
+{
+    struct bstr param = bstr0(*value);
+    bool help = bstr_equals0(param, "help");
+    bool adapter_matched = false;
+    struct bstr listing = { 0 };
+
+    if (bstr_equals0(param, "")) {
+        return 0;
+    }
+
+    adapter_matched = mp_dxgi_list_or_verify_adapters(log,
+                                                      help ? bstr0(NULL) : param,
+                                                      help ? &listing : NULL);
+
+    if (help) {
+        mp_info(log, "Available DXGI adapters:\n%.*s",
+                BSTR_P(listing));
+        talloc_free(listing.start);
+        return M_OPT_EXIT;
+    }
+
+    if (!adapter_matched) {
+        mp_err(log, "No adapter matching '%.*s'!\n", BSTR_P(param));
+    }
+
+    return adapter_matched ? 0 : M_OPT_INVALID;
+}
+
 static HRESULT create_device(struct mp_log *log, IDXGIAdapter1 *adapter,
                              bool warp, bool debug, int max_fl, int min_fl,
                              ID3D11Device **dev)
@@ -455,9 +473,9 @@ static HRESULT create_device(struct mp_log *log, IDXGIAdapter1 *adapter,
                               NULL, flags, levels, levels_len, D3D11_SDK_VERSION, dev, NULL, NULL);
 }
 
-bool mp_d3d11_list_or_verify_adapters(struct mp_log *log,
-                                      bstr adapter_name,
-                                      bstr *listing)
+bool mp_dxgi_list_or_verify_adapters(struct mp_log *log,
+                                     bstr adapter_name,
+                                     bstr *listing)
 {
     IDXGIAdapter1 *picked_adapter = NULL;
 
@@ -465,7 +483,7 @@ bool mp_d3d11_list_or_verify_adapters(struct mp_log *log,
         return false;
     }
 
-    if ((picked_adapter = get_d3d11_adapter(log, adapter_name, listing))) {
+    if ((picked_adapter = mp_get_dxgi_adapter(log, adapter_name, listing))) {
         SAFE_RELEASE(picked_adapter);
         return true;
     }
@@ -480,6 +498,7 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
                                     struct d3d11_device_opts *opts,
                                     ID3D11Device **dev_out)
 {
+    bool debug = opts->debug;
     bool warp = opts->force_warp;
     int max_fl = opts->max_feature_level;
     int min_fl = opts->min_feature_level;
@@ -496,7 +515,7 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
         goto done;
     }
 
-    adapter = get_d3d11_adapter(log, bstr0(adapter_name), NULL);
+    adapter = mp_get_dxgi_adapter(log, bstr0(adapter_name), NULL);
 
     if (adapter_name && !adapter) {
         mp_warn(log, "Adapter matching '%s' was not found in the system! "
@@ -510,7 +529,15 @@ bool mp_d3d11_create_present_device(struct mp_log *log,
         max_fl = max_fl ? max_fl : D3D_FEATURE_LEVEL_11_0;
         min_fl = min_fl ? min_fl : D3D_FEATURE_LEVEL_9_1;
 
-        hr = create_device(log, adapter, warp, opts->debug, max_fl, min_fl, &dev);
+        hr = create_device(log, adapter, warp, debug, max_fl, min_fl, &dev);
+
+        // Retry without debug, if SDK is not available
+        if (debug && hr == DXGI_ERROR_SDK_COMPONENT_MISSING) {
+            mp_warn(log, "gpu-debug disabled due to error: %s\n", mp_HRESULT_to_str(hr));
+            debug = false;
+            continue;
+        }
+
         if (SUCCEEDED(hr))
             break;
 
@@ -630,7 +657,21 @@ static HRESULT create_swapchain_1_2(ID3D11Device *dev, IDXGIFactory2 *factory,
     };
 
     if (flip) {
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        // UNORDERED_ACCESS with FLIP_SEQUENTIAL seems to be buggy with
+        // Windows 7 drivers
+        if ((desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) &&
+            !IsWindows8OrGreater())
+        {
+            mp_verbose(log, "Disabling UNORDERED_ACCESS for flip-model "
+                            "swapchain backbuffers in Windows 7\n");
+            desc.BufferUsage &= ~DXGI_USAGE_UNORDERED_ACCESS;
+        }
+
+        if (IsWindows10OrGreater()) {
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        } else {
+            desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        }
         desc.BufferCount = opts->length;
     } else {
         desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
@@ -770,7 +811,7 @@ static bool configure_created_swapchain(struct mp_log *log,
                                         IDXGISwapChain *swapchain,
                                         DXGI_FORMAT requested_format,
                                         DXGI_COLOR_SPACE_TYPE requested_csp,
-                                        struct mp_colorspace *configured_csp)
+                                        struct pl_color_space *configured_csp)
 {
     DXGI_FORMAT probed_format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT selected_format = DXGI_FORMAT_UNKNOWN;
@@ -778,7 +819,7 @@ static bool configure_created_swapchain(struct mp_log *log,
     DXGI_COLOR_SPACE_TYPE selected_colorspace;
     const char *format_name = NULL;
     const char *csp_name = NULL;
-    struct mp_colorspace mp_csp = { 0 };
+    struct pl_color_space pl_color_system = { 0 };
     bool mp_csp_mapped = false;
 
     query_output_format_and_colorspace(log, swapchain,
@@ -794,7 +835,7 @@ static bool configure_created_swapchain(struct mp_log *log,
                           requested_csp : probed_colorspace;
     format_name   = d3d11_get_format_name(selected_format);
     csp_name      = d3d11_get_csp_name(selected_colorspace);
-    mp_csp_mapped = d3d11_get_mp_csp(selected_colorspace, &mp_csp);
+    mp_csp_mapped = d3d11_get_mp_csp(selected_colorspace, &pl_color_system);
 
     mp_verbose(log, "Selected swapchain format %s (%d), attempting "
                     "to utilize it.\n",
@@ -825,7 +866,7 @@ static bool configure_created_swapchain(struct mp_log *log,
                      "mapping! Overriding to standard sRGB!\n",
                 csp_name, selected_colorspace);
         selected_colorspace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-        d3d11_get_mp_csp(selected_colorspace, &mp_csp);
+        d3d11_get_mp_csp(selected_colorspace, &pl_color_system);
     }
 
     mp_verbose(log, "Selected swapchain color space %s (%d), attempting to "
@@ -837,7 +878,7 @@ static bool configure_created_swapchain(struct mp_log *log,
     }
 
     if (configured_csp) {
-        *configured_csp = mp_csp;
+        *configured_csp = pl_color_system;
     }
 
     return true;
@@ -921,7 +962,9 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
 
     DXGI_SWAP_CHAIN_DESC scd = {0};
     IDXGISwapChain_GetDesc(swapchain, &scd);
-    if (scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) {
+    if (scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ||
+        scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
+    {
         mp_verbose(log, "Using flip-model presentation\n");
     } else {
         mp_verbose(log, "Using bitblt-model presentation\n");
@@ -939,3 +982,60 @@ done:
     SAFE_RELEASE(dxgi_dev);
     return success;
 }
+
+bool mp_get_dxgi_output_desc(IDXGISwapChain *swapchain, DXGI_OUTPUT_DESC1 *desc)
+{
+    bool ret = false;
+    IDXGIOutput *output = NULL;
+    IDXGIOutput6 *output6 = NULL;
+
+    if (FAILED(IDXGISwapChain_GetContainingOutput(swapchain, &output)))
+        goto done;
+
+    if (FAILED(IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6, (void**)&output6)))
+        goto done;
+
+    ret = SUCCEEDED(IDXGIOutput6_GetDesc1(output6, desc));
+
+done:
+    SAFE_RELEASE(output);
+    SAFE_RELEASE(output6);
+    return ret;
+}
+
+#if HAVE_DXGI_DEBUG
+void mp_d3d11_get_debug_interfaces(struct mp_log *log, IDXGIDebug **debug,
+                                   IDXGIInfoQueue **iqueue)
+{
+    load_d3d11_functions(log);
+
+    *iqueue = NULL;
+    *debug = NULL;
+
+    if (!pDXGIGetDebugInterface)
+        return;
+
+    HRESULT hr;
+
+    hr = pDXGIGetDebugInterface(&IID_IDXGIInfoQueue, (void **) iqueue);
+    if (FAILED(hr)) {
+        mp_fatal(log, "Failed to get info queue: %s\n", mp_HRESULT_to_str(hr));
+        return;
+    }
+
+    // Store an unlimited amount of messages in the buffer. This is fine
+    // because we flush stored messages regularly (in debug_marker.)
+    IDXGIInfoQueue_SetMessageCountLimit(*iqueue, DXGI_DEBUG_D3D11, -1);
+    IDXGIInfoQueue_SetMessageCountLimit(*iqueue, DXGI_DEBUG_DXGI, -1);
+
+    // Push empty filter to get everything
+    DXGI_INFO_QUEUE_FILTER filter = {0};
+    IDXGIInfoQueue_PushStorageFilter(*iqueue, DXGI_DEBUG_ALL, &filter);
+
+    hr = pDXGIGetDebugInterface(&IID_IDXGIDebug, (void **) debug);
+    if (FAILED(hr)) {
+        mp_fatal(log, "Failed to get debug device: %s\n", mp_HRESULT_to_str(hr));
+        return;
+    }
+}
+#endif

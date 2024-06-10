@@ -26,8 +26,6 @@
 
 #include <libavutil/common.h>
 
-#include "config.h"
-
 #include "mpv_talloc.h"
 #include "common/common.h"
 #include "misc/bstr.h"
@@ -48,12 +46,10 @@ struct gpu_priv {
 
     char *context_name;
     char *context_type;
-    struct ra_ctx_opts opts;
     struct gl_video *renderer;
 
     int events;
 };
-
 static void resize(struct vo *vo)
 {
     struct gpu_priv *p = vo->priv;
@@ -84,11 +80,16 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     if (!sw->fns->start_frame(sw, &fbo))
         return;
 
-    gl_video_render_frame(p->renderer, frame, fbo, RENDER_FRAME_DEF);
+    gl_video_render_frame(p->renderer, frame, &fbo, RENDER_FRAME_DEF);
     if (!sw->fns->submit_frame(sw, frame)) {
         MP_ERR(vo, "Failed presenting frame!\n");
         return;
     }
+
+    struct mp_image_params *params = gl_video_get_target_params_ptr(p->renderer);
+    mp_mutex_lock(&vo->params_mutex);
+    vo->target_params = params;
+    mp_mutex_unlock(&vo->params_mutex);
 }
 
 static void flip_page(struct vo *vo)
@@ -127,18 +128,18 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     return 0;
 }
 
-static void request_hwdec_api(struct vo *vo)
+static void request_hwdec_api(struct vo *vo, void *data)
 {
     struct gpu_priv *p = vo->priv;
-
-    gl_video_load_hwdecs_all(p->renderer, vo->hwdec_devs);
+    gl_video_load_hwdecs_for_img_fmt(p->renderer, vo->hwdec_devs, data);
 }
 
-static void call_request_hwdec_api(void *ctx)
+static void call_request_hwdec_api(void *ctx,
+                                   struct hwdec_imgfmt_request *params)
 {
     // Roundabout way to run hwdec loading on the VO thread.
     // Redirects to request_hwdec_api().
-    vo_control(ctx, VOCTRL_LOAD_HWDEC_API, NULL);
+    vo_control(ctx, VOCTRL_LOAD_HWDEC_API, params);
 }
 
 static void get_and_update_icc_profile(struct gpu_priv *p)
@@ -173,13 +174,14 @@ static void get_and_update_ambient_lighting(struct gpu_priv *p)
     }
 }
 
-static void update_ra_ctx_options(struct vo *vo)
+static void update_ra_ctx_options(struct vo *vo, struct ra_ctx_opts *ctx_opts)
 {
     struct gpu_priv *p = vo->priv;
-
-    /* Only the alpha option has any runtime toggle ability. */
     struct gl_video_opts *gl_opts = mp_get_config_group(p->ctx, vo->global, &gl_video_conf);
-    p->ctx->opts.want_alpha = gl_opts->alpha_mode == 1;
+    ctx_opts->want_alpha = (gl_opts->background == BACKGROUND_COLOR &&
+                            gl_opts->background_color.a != 255) ||
+                            gl_opts->background == BACKGROUND_NONE;
+    talloc_free(gl_opts);
 }
 
 static int control(struct vo *vo, uint32_t request, void *data)
@@ -190,9 +192,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;
-    case VOCTRL_SET_EQUALIZER:
-        vo->want_redraw = true;
-        return VO_TRUE;
     case VOCTRL_SCREENSHOT: {
         struct vo_frame *frame = vo_get_current_vo_frame(vo);
         if (frame)
@@ -201,15 +200,17 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return true;
     }
     case VOCTRL_LOAD_HWDEC_API:
-        request_hwdec_api(vo);
+        request_hwdec_api(vo, data);
         return true;
     case VOCTRL_UPDATE_RENDER_OPTS: {
-        update_ra_ctx_options(vo);
+        struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
+        update_ra_ctx_options(vo, ctx_opts);
         gl_video_configure_queue(p->renderer, vo);
         get_and_update_icc_profile(p);
         if (p->ctx->fns->update_render_opts)
             p->ctx->fns->update_render_opts(p->ctx);
         vo->want_redraw = true;
+        talloc_free(ctx_opts);
         return true;
     }
     case VOCTRL_RESET:
@@ -256,22 +257,22 @@ static void wakeup(struct vo *vo)
         p->ctx->fns->wakeup(p->ctx);
 }
 
-static void wait_events(struct vo *vo, int64_t until_time_us)
+static void wait_events(struct vo *vo, int64_t until_time_ns)
 {
     struct gpu_priv *p = vo->priv;
     if (p->ctx && p->ctx->fns->wait_events) {
-        p->ctx->fns->wait_events(p->ctx, until_time_us);
+        p->ctx->fns->wait_events(p->ctx, until_time_ns);
     } else {
-        vo_wait_default(vo, until_time_us);
+        vo_wait_default(vo, until_time_ns);
     }
 }
 
 static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
-                                  int stride_align)
+                                  int stride_align, int flags)
 {
     struct gpu_priv *p = vo->priv;
 
-    return gl_video_get_image(p->renderer, imgfmt, w, h, stride_align);
+    return gl_video_get_image(p->renderer, imgfmt, w, h, stride_align, flags);
 }
 
 static void uninit(struct vo *vo)
@@ -291,11 +292,10 @@ static int preinit(struct vo *vo)
     struct gpu_priv *p = vo->priv;
     p->log = vo->log;
 
-    struct ra_ctx_opts opts = p->opts;
-    struct gl_video_opts *gl_opts = mp_get_config_group(p->ctx, vo->global, &gl_video_conf);
-    opts.want_alpha = gl_opts->alpha_mode == 1;
-
-    p->ctx = ra_ctx_create(vo, p->context_type, p->context_name, opts);
+    struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
+    update_ra_ctx_options(vo, ctx_opts);
+    p->ctx = ra_ctx_create(vo, *ctx_opts);
+    talloc_free(ctx_opts);
     if (!p->ctx)
         goto err_out;
     assert(p->ctx->ra);
@@ -310,7 +310,7 @@ static int preinit(struct vo *vo)
     vo->hwdec_devs = hwdec_devices_create();
     hwdec_devices_set_loader(vo->hwdec_devs, call_request_hwdec_api, vo);
 
-    gl_video_load_hwdecs(p->renderer, vo->hwdec_devs, false);
+    gl_video_init_hwdecs(p->renderer, p->ctx, vo->hwdec_devs, false);
 
     return 0;
 
@@ -318,19 +318,6 @@ err_out:
     uninit(vo);
     return -1;
 }
-
-#define OPT_BASE_STRUCT struct gpu_priv
-static const m_option_t options[] = {
-    {"gpu-context",
-        OPT_STRING_VALIDATE(context_name, ra_ctx_validate_context),
-        .help = ra_ctx_context_help},
-    {"gpu-api",
-        OPT_STRING_VALIDATE(context_type, ra_ctx_validate_api),
-        .help = ra_ctx_api_help},
-    {"gpu-debug", OPT_FLAG(opts.debug)},
-    {"gpu-sw", OPT_FLAG(opts.allow_sw)},
-    {0}
-};
 
 const struct vo_driver video_out_gpu = {
     .description = "Shader-based GPU Renderer",
@@ -348,5 +335,4 @@ const struct vo_driver video_out_gpu = {
     .wakeup = wakeup,
     .uninit = uninit,
     .priv_size = sizeof(struct gpu_priv),
-    .options = options,
 };

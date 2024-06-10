@@ -56,6 +56,8 @@ static inline struct bstr bstrdup(void *talloc_ctx, struct bstr str)
     return r;
 }
 
+#define bstr0_lit(s) {(unsigned char *)(s), sizeof("" s) - 1}
+
 static inline struct bstr bstr0(const char *s)
 {
     return (struct bstr){(unsigned char *)s, s ? strlen(s) : 0};
@@ -222,6 +224,12 @@ static inline bool bstr_eatend0(struct bstr *s, const char *prefix)
 {
     return bstr_eatend(s, bstr0(prefix));
 }
+
+#ifdef _WIN32
+
+int bstr_to_wchar(void *talloc_ctx, struct bstr s, wchar_t **ret);
+
+#endif
 
 // create a pair (not single value!) for "%.*s" printf syntax
 #define BSTR_P(bstr) (int)((bstr).len), ((bstr).start ? (char*)(bstr).start : "")

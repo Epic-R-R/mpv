@@ -24,11 +24,11 @@
 
 #include "options/m_option.h"
 
-// NOTE: VOs must support at least SUBBITMAP_RGBA.
+// NOTE: VOs must support at least SUBBITMAP_BGRA.
 enum sub_bitmap_format {
     SUBBITMAP_EMPTY = 0,// no bitmaps; always has num_parts==0
     SUBBITMAP_LIBASS,   // A8, with a per-surface blend color (libass.color)
-    SUBBITMAP_RGBA,     // IMGFMT_BGRA (MSB=A, LSB=B), scaled, premultiplied alpha
+    SUBBITMAP_BGRA,     // IMGFMT_BGRA (MSB=A, LSB=B), scaled, premultiplied alpha
 
     SUBBITMAP_COUNT
 };
@@ -64,7 +64,7 @@ struct sub_bitmaps {
     // Packed representation of the bitmap data. If non-NULL, then the
     // parts[].bitmap pointer points into the image data here (and stride will
     // correspond to packed->stride[0]).
-    //  SUBBITMAP_RGBA: IMGFMT_BGRA (exact match)
+    //  SUBBITMAP_BGRA: IMGFMT_BGRA (exact match)
     //  SUBBITMAP_LIBASS: IMGFMT_Y8 (not the same, but compatible layout)
     // Other formats have this set to NULL.
     struct mp_image *packed;
@@ -74,6 +74,8 @@ struct sub_bitmaps {
     int packed_w, packed_h;
 
     int change_id;  // Incremented on each change (0 is never used)
+
+    bool video_color_space; // True if the bitmap is in video color space
 };
 
 struct sub_bitmap_list {
@@ -82,7 +84,7 @@ struct sub_bitmap_list {
     int64_t change_id;
 
     // Bounding box for rendering. It's notable that SUBBITMAP_LIBASS images are
-    // always within these bounds, while SUBBITMAP_RGBA is not necessarily.
+    // always within these bounds, while SUBBITMAP_BGRA is not necessarily.
     int w, h;
 
     // Sorted by sub_bitmaps.render_index. Unused parts are not in the array,
@@ -124,6 +126,7 @@ enum mp_osd_font_codepoints {
     OSD_BRIGHTNESS = 0x0A,
     OSD_HUE = 0x0B,
     OSD_BALANCE = 0x0C,
+    OSD_REV = 0x0D,
     OSD_PANSCAN = 0x50,
 
     OSD_PB_START = 0x10,
@@ -153,10 +156,11 @@ struct osd_style_opts {
     int align_x;
     int align_y;
     float blur;
-    int bold;
-    int italic;
+    bool bold;
+    bool italic;
     int justify;
     int font_provider;
+    char *fonts_dir;
 };
 
 extern const struct m_sub_options osd_style_conf;
@@ -242,5 +246,6 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov);
 void osd_set_external_remove_owner(struct osd_state *osd, void *owner);
 void osd_get_text_size(struct osd_state *osd, int *out_screen_h, int *out_font_h);
 void osd_get_function_sym(char *buffer, size_t buffer_size, int osd_function);
+void osd_mangle_ass(bstr *dst, const char *in, bool replace_newlines);
 
 #endif /* MPLAYER_SUB_H */

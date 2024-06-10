@@ -1,6 +1,5 @@
 -- Note: anything global is accessible by profile condition expressions.
 
-local utils = require 'mp.utils'
 local msg = require 'mp.msg'
 
 local profiles = {}
@@ -14,6 +13,12 @@ local pending_hooks = {}            -- as set (keys only, meaningless values)
 -- profile the condition is evaluated for.
 local current_profile = nil
 
+-- Cached set of all top-level mpv properities. Only used for extra validation.
+local property_set = {}
+for _, property in pairs(mp.get_property_native("property-list")) do
+    property_set[property] = true
+end
+
 local function evaluate(profile)
     msg.verbose("Re-evaluating auto profile " .. profile.name)
 
@@ -25,11 +30,8 @@ local function evaluate(profile)
         -- errors can be "normal", e.g. in case properties are unavailable
         msg.verbose("Profile condition error on evaluating: " .. res)
         res = false
-    elseif type(res) ~= "boolean" then
-        msg.verbose("Profile condition did not return a boolean, but "
-                    .. type(res) .. ".")
-        res = false
     end
+    res = not not res
     if res ~= profile.status then
         if res == true then
             msg.info("Applying auto profile: " .. profile.name)
@@ -87,8 +89,16 @@ function get(name, default)
     -- Normally, we use the cached value only
     if not watched_properties[name] then
         watched_properties[name] = true
+        local res, err = mp.get_property_native(name)
+        -- Property has to not exist and the toplevel of property in the name must also
+        -- not have an existing match in the property set for this to be considered an error.
+        -- This allows things like user-data/test to still work.
+        if err == "property not found" and property_set[name:match("^([^/]+)")] == nil then
+            msg.error("Property '" .. name .. "' was not found.")
+            return default
+        end
+        cached_properties[name] = res
         mp.observe_property(name, "native", on_property_change)
-        cached_properties[name] = mp.get_property_native(name)
     end
     -- The first time the property is read we need add it to the
     -- properties_to_profiles table, which will be used to mark the profile
@@ -117,7 +127,7 @@ end
 
 local evil_magic = {}
 setmetatable(evil_magic, {
-    __index = function(table, key)
+    __index = function(_, key)
         -- interpret everything as property, unless it already exists as
         -- a non-nil global value
         local v = _G[key]
@@ -130,7 +140,7 @@ setmetatable(evil_magic, {
 
 p = {}
 setmetatable(p, {
-    __index = function(table, key)
+    __index = function(_, key)
         return magic_get(key)
     end,
 })
@@ -138,6 +148,8 @@ setmetatable(p, {
 local function compile_cond(name, s)
     local code, chunkname = "return " .. s, "profile " .. name .. " condition"
     local chunk, err
+    -- luacheck: push
+    -- luacheck: ignore setfenv loadstring
     if setfenv then -- lua 5.1
         chunk, err = loadstring(code, chunkname)
         if chunk then
@@ -146,6 +158,7 @@ local function compile_cond(name, s)
     else -- lua 5.2
         chunk, err = load(code, chunkname, "t", evil_magic)
     end
+    -- luacheck: pop
     if not chunk then
         msg.error("Profile '" .. name .. "' condition: " .. err)
         chunk = function() return false end
@@ -153,8 +166,8 @@ local function compile_cond(name, s)
     return chunk
 end
 
-local function load_profiles()
-    for i, v in ipairs(mp.get_property_native("profile-list")) do
+local function load_profiles(profiles_property)
+    for _, v in ipairs(profiles_property) do
         local cond = v["profile-cond"]
         if cond and #cond > 0 then
             local profile = {
@@ -163,7 +176,7 @@ local function load_profiles()
                 properties = {},
                 status = nil,
                 dirty = true, -- need re-evaluate
-                has_restore_opt = v["profile-restore"] ~= "default"
+                has_restore_opt = v["profile-restore"] and v["profile-restore"] ~= "default"
             }
             profiles[#profiles + 1] = profile
             have_dirty_profiles = true
@@ -171,17 +184,25 @@ local function load_profiles()
     end
 end
 
-load_profiles()
+mp.observe_property("profile-list", "native", function (_, profiles_property)
+    profiles = {}
+    watched_properties = {}
+    cached_properties = {}
+    properties_to_profiles = {}
+    mp.unobserve_property(on_property_change)
 
-if #profiles < 1 and mp.get_property("load-auto-profiles") == "auto" then
-    -- make it exit immediately
-    _G.mp_event_loop = function() end
-    return
-end
+    load_profiles(profiles_property)
+
+    if #profiles < 1 and mp.get_property("load-auto-profiles") == "auto" then
+        -- make it exit immediately
+        _G.mp_event_loop = function() end
+        return
+    end
+
+    on_idle() -- re-evaluate all profiles immediately
+end)
 
 mp.register_idle(on_idle)
 for _, name in ipairs({"on_load", "on_preloaded", "on_before_start_file"}) do
     mp.add_hook(name, 50, on_hook)
 end
-
-on_idle() -- re-evaluate all profiles immediately

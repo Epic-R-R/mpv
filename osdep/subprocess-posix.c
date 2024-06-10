@@ -16,7 +16,6 @@
  */
 
 #include <poll.h>
-#include <pthread.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -32,6 +31,12 @@
 #include "stream/stream.h"
 
 extern char **environ;
+
+#ifdef SIGRTMAX
+#define SIGNAL_MAX SIGRTMAX
+#else
+#define SIGNAL_MAX 32
+#endif
 
 #define SAFE_CLOSE(fd) do { if ((fd) >= 0) close((fd)); (fd) = -1; } while (0)
 
@@ -65,6 +70,20 @@ static int as_execvpe(const char *path, const char *file, char *const argv[],
     return -1;
 }
 
+// In the child process, resets the signal mask to defaults. Also clears any
+// signal handlers first so nothing funny happens.
+static void reset_signals_child(void)
+{
+    struct sigaction sa = { 0 };
+    sigset_t sigmask;
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sigmask);
+
+    for (int nr = 1; nr < SIGNAL_MAX; nr++)
+        sigaction(nr, &sa, NULL);
+    sigprocmask(SIG_SETMASK, &sigmask, NULL);
+}
+
 // Returns 0 on any error, valid PID on success.
 // This function must be async-signal-safe, as it may be called from a fork().
 static pid_t spawn_process(const char *path, struct mp_subprocess_opts *opts,
@@ -96,6 +115,7 @@ static pid_t spawn_process(const char *path, struct mp_subprocess_opts *opts,
     }
     if (fres == 0) {
         // child
+        reset_signals_child();
 
         for (int n = 0; n < opts->num_fds; n++) {
             if (src_fds[n] == opts->fds[n].fd) {
@@ -113,7 +133,7 @@ static pid_t spawn_process(const char *path, struct mp_subprocess_opts *opts,
         as_execvpe(path, opts->exe, opts->args, opts->env ? opts->env : environ);
 
     child_failed:
-        write(p[1], &(char){1}, 1); // shouldn't be able to fail
+        (void)write(p[1], &(char){1}, 1); // shouldn't be able to fail
         _exit(1);
     }
 
@@ -261,7 +281,7 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
                     if (pid)
                         kill(pid, SIGKILL);
                     killed_by_us = true;
-                    break;
+                    goto break_poll;
                 }
                 struct mp_subprocess_fd *fd = &opts->fds[n];
                 if (fd->on_read) {
@@ -295,6 +315,8 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
             }
         }
     }
+
+break_poll:
 
     // Note: it can happen that a child process closes the pipe, but does not
     //       terminate yet. In this case, we would have to run waitpid() in

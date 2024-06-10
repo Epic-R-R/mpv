@@ -17,9 +17,10 @@
 
 #pragma once
 
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
 #include "common/common.h"
 #include "common/global.h"
@@ -29,7 +30,6 @@
 #include "misc/bstr.h"
 #include "misc/dispatch.h"
 #include "options/m_option.h"
-#include "osdep/atomic.h"
 
 // m_config provides an API to manipulate the config variables in MPlayer.
 // It makes use of the Options API to provide a context stack that
@@ -75,6 +75,7 @@ typedef struct m_config {
     int profile_backup_flags;
 
     struct m_opt_backup *backup_opts;
+    struct m_opt_backup *watch_later_backup_opts;
 
     bool use_profiles;
     bool is_toplevel;
@@ -114,10 +115,9 @@ struct m_config *m_config_new(void *talloc_ctx, struct mp_log *log,
 // different sub-options for every filter (represented by separate desc
 // structs).
 // args is an array of key/value pairs (args=[k0, v0, k1, v1, ..., NULL]).
-// name/defaults is only needed for the legacy af-defaults/vf-defaults options.
 struct m_config *m_config_from_obj_desc_and_args(void *ta_parent,
     struct mp_log *log, struct mpv_global *global, struct m_obj_desc *desc,
-    const char *name, struct m_obj_settings *defaults, char **args);
+    char **args);
 
 // Like m_config_from_obj_desc_and_args(), but don't allocate option the
 // struct, i.e. m_config.optstruct==NULL. This is used by the sub-option
@@ -134,9 +134,17 @@ void m_config_backup_opt(struct m_config *config, const char *opt);
 // Call m_config_backup_opt() on all options.
 void m_config_backup_all_opts(struct m_config *config);
 
+// Backup options on startup so that quit-watch-later can compare the current
+// values to their backups, and save them only if they have been changed.
+void m_config_backup_watch_later_opts(struct m_config *config);
+
 // Restore all options backed up with m_config_backup_opt(), and delete the
 // backups afterwards.
 void m_config_restore_backups(struct m_config *config);
+
+// Whether opt_name is different from its initial value.
+bool m_config_watch_later_backup_opt_changed(struct m_config *config,
+                                             char *opt_name);
 
 enum {
     M_SETOPT_PRE_PARSE_ONLY = 1,    // Silently ignore non-M_OPT_PRE_PARSE opt.

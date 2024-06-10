@@ -43,7 +43,7 @@ int drm_object_create_properties(struct mp_log *log, int fd,
 
     return 0;
 
-  fail:
+fail:
     drm_object_free_properties(object);
     return -1;
 }
@@ -68,53 +68,53 @@ void drm_object_free_properties(struct drm_object *object)
 
 int drm_object_get_property(struct drm_object *object, char *name, uint64_t *value)
 {
-   for (int i = 0; i < object->props->count_props; i++) {
-       if (strcasecmp(name, object->props_info[i]->name) == 0) {
-           *value = object->props->prop_values[i];
-           return 0;
-       }
-   }
+    for (int i = 0; i < object->props->count_props; i++) {
+        if (strcasecmp(name, object->props_info[i]->name) == 0) {
+            *value = object->props->prop_values[i];
+            return 0;
+        }
+    }
 
-   return -EINVAL;
+    return -EINVAL;
 }
 
 drmModePropertyBlobPtr drm_object_get_property_blob(struct drm_object *object, char *name)
 {
-   uint64_t blob_id;
+    uint64_t blob_id;
 
-   if (!drm_object_get_property(object, name, &blob_id)) {
-       return drmModeGetPropertyBlob(object->fd, blob_id);
-   }
+    if (!drm_object_get_property(object, name, &blob_id)) {
+        return drmModeGetPropertyBlob(object->fd, blob_id);
+    }
 
-   return NULL;
+    return NULL;
 }
 
 int drm_object_set_property(drmModeAtomicReq *request, struct drm_object *object,
                             char *name, uint64_t value)
 {
-   for (int i = 0; i < object->props->count_props; i++) {
-       if (strcasecmp(name, object->props_info[i]->name) == 0) {
-           if (object->props_info[i]->flags & DRM_MODE_PROP_IMMUTABLE) {
-               /* Do not try to set immutable values, as this might cause the
-                * atomic commit operation to fail. */
-               return -EINVAL;
-           }
-           return drmModeAtomicAddProperty(request, object->id,
-                                           object->props_info[i]->prop_id, value);
-       }
-   }
+    for (int i = 0; i < object->props->count_props; i++) {
+        if (strcasecmp(name, object->props_info[i]->name) == 0) {
+            if (object->props_info[i]->flags & DRM_MODE_PROP_IMMUTABLE) {
+                /* Do not try to set immutable values, as this might cause the
+                 * atomic commit operation to fail. */
+                return -EINVAL;
+            }
+            return drmModeAtomicAddProperty(request, object->id,
+                                            object->props_info[i]->prop_id, value);
+        }
+    }
 
-   return -EINVAL;
+    return -EINVAL;
 }
 
-struct drm_object * drm_object_create(struct mp_log *log, int fd,
-                                      uint32_t object_id, uint32_t type)
+struct drm_object *drm_object_create(struct mp_log *log, int fd,
+                                     uint32_t object_id, uint32_t type)
 {
     struct drm_object *obj = NULL;
     obj = talloc_zero(NULL, struct drm_object);
+    obj->fd = fd;
     obj->id = object_id;
     obj->type = type;
-    obj->fd = fd;
 
     if (drm_object_create_properties(log, fd, obj)) {
         talloc_free(obj);
@@ -165,7 +165,7 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
 
     plane_res = drmModeGetPlaneResources(fd);
     if (!plane_res) {
-        mp_err(log, "Cannot retrieve plane ressources: %s\n", mp_strerror(errno));
+        mp_err(log, "Cannot retrieve plane resources: %s\n", mp_strerror(errno));
         goto fail;
     }
 
@@ -195,7 +195,6 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
             if (connector->connector_id == connector_id)
                 ctx->connector =  drm_object_create(log, ctx->fd, connector->connector_id,
                                                     DRM_MODE_OBJECT_CONNECTOR);
-
             drmModeFreeConnector(connector);
             if (ctx->connector)
                 break;
@@ -211,8 +210,7 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
         drmplane = NULL;
 
         if (possible_crtcs & (1 << crtc_index)) {
-            plane = drm_object_create(log, ctx->fd, plane_id,
-                                      DRM_MODE_OBJECT_PLANE);
+            plane = drm_object_create(log, ctx->fd, plane_id, DRM_MODE_OBJECT_PLANE);
 
             if (!plane) {
                 mp_err(log, "Failed to create Plane object from plane ID %d\n",
@@ -274,7 +272,7 @@ struct drm_atomic_context *drm_atomic_create_context(struct mp_log *log, int fd,
             mp_verbose(log, "Using %s plane %d as drmprime plane\n", plane_type, drmprime_video_plane_id);
             ctx->drmprime_video_plane = drm_object_create(log, ctx->fd, drmprime_video_plane_id, DRM_MODE_OBJECT_PLANE);
         } else {
-            mp_verbose(log, "Failed to find drmprime plane with idx=%d. drmprime-drm hwdec interop will not work\n", drmprime_video_plane_idx);
+            mp_verbose(log, "Failed to find drmprime plane with idx=%d. drmprime-overlay hwdec interop will not work\n", drmprime_video_plane_idx);
         }
     } else {
         mp_verbose(log, "Found drmprime plane with ID %d\n", ctx->drmprime_video_plane->id);
@@ -389,6 +387,9 @@ bool drm_atomic_save_old_state(struct drm_atomic_context *ctx)
     if (0 > drm_object_get_property(ctx->crtc, "ACTIVE", &ctx->old_state.crtc.active))
         ret = false;
 
+    // This property was added in kernel 5.0. We will just ignore any errors.
+    drm_object_get_property(ctx->crtc, "VRR_ENABLED", &ctx->old_state.crtc.vrr_enabled);
+
     if (0 > drm_object_get_property(ctx->connector, "CRTC_ID", &ctx->old_state.connector.crtc_id))
         ret = false;
 
@@ -411,6 +412,9 @@ bool drm_atomic_restore_old_state(drmModeAtomicReqPtr request, struct drm_atomic
 
     if (0 > drm_object_set_property(request, ctx->connector, "CRTC_ID", ctx->old_state.connector.crtc_id))
         ret = false;
+
+    // This property was added in kernel 5.0. We will just ignore any errors.
+    drm_object_set_property(request, ctx->crtc, "VRR_ENABLED", ctx->old_state.crtc.vrr_enabled);
 
     if (!drm_mode_ensure_blob(ctx->fd, &ctx->old_state.crtc.mode))
         ret = false;

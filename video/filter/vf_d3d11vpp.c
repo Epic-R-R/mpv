@@ -43,9 +43,10 @@
 #define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_FRAME_RATE_CONVERSION 0x20
 
 struct opts {
-    int deint_enabled;
-    int interlaced_only;
+    bool deint_enabled;
+    bool interlaced_only;
     int mode;
+    int field_parity;
 };
 
 struct priv {
@@ -102,8 +103,7 @@ static struct mp_image *alloc_pool(void *pctx, int fmt, int w, int h)
         return NULL;
 
     struct mp_image *mpi = mp_image_new_custom_ref(NULL, texture, release_tex);
-    if (!mpi)
-        abort();
+    MP_HANDLE_OOM(mpi);
 
     mp_image_setfmt(mpi, IMGFMT_D3D11);
     mp_image_set_size(mpi, w, h);
@@ -181,7 +181,7 @@ static int recreate_video_proc(struct mp_filter *vf)
         rindex = 0;
     }
 
-    // TOOD: so, how do we select which rate conversion mode the processor uses?
+    // TODO: so, how do we select which rate conversion mode the processor uses?
 
     hr = ID3D11VideoDevice_CreateVideoProcessor(p->video_dev, p->vp_enum, rindex,
                                                 &p->video_proc);
@@ -211,8 +211,8 @@ static int recreate_video_proc(struct mp_filter *vf)
                                                          FALSE, 0);
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE csp = {
-        .YCbCr_Matrix = p->params.color.space != MP_CSP_BT_601,
-        .Nominal_Range = p->params.color.levels == MP_CSP_LEVELS_TV ? 1 : 2,
+        .YCbCr_Matrix = p->params.repr.sys != PL_COLOR_SYSTEM_BT_601,
+        .Nominal_Range = p->params.repr.levels == PL_COLOR_LEVELS_LIMITED ? 1 : 2,
     };
     ID3D11VideoContext_VideoProcessorSetStreamColorSpace(p->video_ctx,
                                                          p->video_proc,
@@ -428,10 +428,14 @@ static struct mp_filter *vf_d3d11vpp_create(struct mp_filter *parent,
     if (!info || !info->hwdec_devs)
         goto fail;
 
-    hwdec_devices_request_all(info->hwdec_devs);
+    struct hwdec_imgfmt_request params = {
+        .imgfmt = IMGFMT_D3D11,
+        .probing = false,
+    };
+    hwdec_devices_request_for_img_fmt(info->hwdec_devs, &params);
 
     struct mp_hwdec_ctx *hwctx =
-        hwdec_devices_get_by_lavc(info->hwdec_devs, AV_HWDEVICE_TYPE_D3D11VA);
+        hwdec_devices_get_by_imgfmt(info->hwdec_devs, IMGFMT_D3D11);
     if (!hwctx || !hwctx->av_device_ref)
         goto fail;
     AVHWDeviceContext *avhwctx = (void *)hwctx->av_device_ref->data;
@@ -466,6 +470,7 @@ static struct mp_filter *vf_d3d11vpp_create(struct mp_filter *parent,
         (p->opts->deint_enabled ? MP_MODE_DEINT : 0) |
         MP_MODE_OUTPUT_FIELDS |
         (p->opts->interlaced_only ? MP_MODE_INTERLACED_ONLY : 0));
+    mp_refqueue_set_parity(p->queue, p->opts->field_parity);
 
     return f;
 
@@ -476,8 +481,8 @@ fail:
 
 #define OPT_BASE_STRUCT struct opts
 static const m_option_t vf_opts_fields[] = {
-    {"deint", OPT_FLAG(deint_enabled)},
-    {"interlaced-only", OPT_FLAG(interlaced_only)},
+    {"deint", OPT_BOOL(deint_enabled)},
+    {"interlaced-only", OPT_BOOL(interlaced_only)},
     {"mode", OPT_CHOICE(mode,
         {"blend", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BLEND},
         {"bob", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB},
@@ -485,6 +490,10 @@ static const m_option_t vf_opts_fields[] = {
         {"mocomp", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_MOTION_COMPENSATION},
         {"ivctc", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_INVERSE_TELECINE},
         {"none", 0})},
+    {"parity", OPT_CHOICE(field_parity,
+        {"tff", MP_FIELD_PARITY_TFF},
+        {"bff", MP_FIELD_PARITY_BFF},
+        {"auto", MP_FIELD_PARITY_AUTO})},
     {0}
 };
 
@@ -494,9 +503,9 @@ const struct mp_user_filter_entry vf_d3d11vpp = {
         .name = "d3d11vpp",
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT) {
-            .deint_enabled = 1,
-            .interlaced_only = 0,
+            .deint_enabled = true,
             .mode = D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB,
+            .field_parity = MP_FIELD_PARITY_AUTO,
         },
         .options = vf_opts_fields,
     },

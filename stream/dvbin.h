@@ -22,42 +22,13 @@
 #include <inttypes.h>
 #include <linux/dvb/dmx.h>
 #include <linux/dvb/frontend.h>
-#include <linux/dvb/video.h>
-#include <linux/dvb/audio.h>
 #include <linux/dvb/version.h>
 
 #define MAX_ADAPTERS 16
 #define MAX_FRONTENDS 8
 
-#undef DVB_ATSC
-#if defined(DVB_API_VERSION_MINOR)
-
-/* kernel headers >=2.6.28 have version 5.
- *
- * Version 5 is also called S2API, it adds support for tuning to S2 channels
- * and is extensible for future delivery systems. Old API is deprecated.
- * StreamID-implementation only supported since API >=5.2.
- * At least DTV_ENUM_DELSYS requires 5.5.
- */
-
-#if (DVB_API_VERSION == 5 && DVB_API_VERSION_MINOR >= 5)
-#define DVB_USE_S2API 1
-
-// This had a different name until API 5.8.
-#ifndef DTV_STREAM_ID
-#define DTV_STREAM_ID DTV_ISDBS_TS_ID
-#endif
-#endif
-
-// This is only defined, for convenience, since API 5.8.
-#ifndef NO_STREAM_ID_FILTER
-#define NO_STREAM_ID_FILTER (~0U)
-#endif
-
-#if (DVB_API_VERSION == 3 && DVB_API_VERSION_MINOR >= 1) || DVB_API_VERSION == 5
-#define DVB_ATSC 1
-#endif
-
+#if DVB_API_VERSION < 5 || DVB_API_VERSION_MINOR < 8
+#error DVB support requires a non-ancient kernel
 #endif
 
 #define DVB_CHANNEL_LOWER -1
@@ -108,7 +79,7 @@ typedef struct {
     int dvr_fd;
     int demux_fd[3], demux_fds[DMX_FILTER_SIZE], demux_fds_cnt;
 
-    int is_on;
+    bool is_on;
     int retry;
     unsigned int last_freq;
     bool switching_channel;
@@ -120,7 +91,7 @@ typedef struct {
     int cfg_devno;
     int cfg_timeout;
     char *cfg_file;
-    int cfg_full_transponder;
+    bool cfg_full_transponder;
     int cfg_channel_switch_offset;
 } dvb_opts_t;
 
@@ -132,22 +103,13 @@ typedef struct {
     char *prog;
     int devno;
 
+    int opts_check_time;
     dvb_opts_t *opts;
     struct m_config_cache *opts_cache;
 } dvb_priv_t;
 
 
 /* Keep in sync with enum fe_delivery_system. */
-#ifndef DVB_USE_S2API
-#    define SYS_DVBC_ANNEX_A        1
-#    define SYS_DVBC_ANNEX_B        1
-#    define SYS_DVBT                3
-#    define SYS_DVBS                5
-#    define SYS_DVBS2               6
-#    define SYS_ATSC                11
-#    define SYS_DVBT2               16
-#    define SYS_DVBC_ANNEX_C        18
-#endif
 #define SYS_DVB__COUNT__            (SYS_DVBC_ANNEX_C + 1)
 
 
@@ -160,7 +122,6 @@ typedef struct {
     (0 != ((__mask) & DELSYS_BIT((__bit))))
 
 
-#ifdef DVB_ATSC
 #define DELSYS_SUPP_MASK                                                \
     (                                                                   \
         DELSYS_BIT(SYS_DVBC_ANNEX_A) |                                  \
@@ -170,24 +131,13 @@ typedef struct {
         DELSYS_BIT(SYS_ATSC) |                                          \
         DELSYS_BIT(SYS_DVBC_ANNEX_B) |                                  \
         DELSYS_BIT(SYS_DVBT2) |                                         \
+        DELSYS_BIT(SYS_ISDBT) |                                         \
         DELSYS_BIT(SYS_DVBC_ANNEX_C)                                    \
     )
-#else
-#define DELSYS_SUPP_MASK                                                \
-    (                                                                   \
-        DELSYS_BIT(SYS_DVBC_ANNEX_A) |                                  \
-        DELSYS_BIT(SYS_DVBT) |                                          \
-        DELSYS_BIT(SYS_DVBS) |                                          \
-        DELSYS_BIT(SYS_DVBS2) |                                         \
-        DELSYS_BIT(SYS_DVBT2) |                                         \
-        DELSYS_BIT(SYS_DVBC_ANNEX_C)                                    \
-    )
-#endif
 
 void dvb_update_config(stream_t *);
 int dvb_parse_path(stream_t *);
 int dvb_set_channel(stream_t *, unsigned int, unsigned int);
 dvb_state_t *dvb_get_state(stream_t *);
-void dvb_free_state(dvb_state_t *);
 
 #endif /* MPLAYER_DVBIN_H */

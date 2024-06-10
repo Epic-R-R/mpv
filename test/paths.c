@@ -1,7 +1,8 @@
 #include "common/common.h"
+#include "common/msg.h"
 #include "config.h"
 #include "options/path.h"
-#include "tests.h"
+#include "test_utils.h"
 
 static void test_join(char *file, int line, char *a, char *b, char *c)
 {
@@ -9,6 +10,7 @@ static void test_join(char *file, int line, char *a, char *b, char *c)
     if (strcmp(res, c) != 0) {
         printf("%s:%d: '%s' + '%s' = '%s', expected '%s'\n", file, line,
                a, b, res, c);
+        fflush(stdout);
         abort();
     }
     talloc_free(res);
@@ -19,8 +21,22 @@ static void test_abs(char *file, int line, bool abs, char *a)
     if (mp_path_is_absolute(bstr0(a)) != abs) {
         printf("%s:%d: mp_path_is_absolute('%s') => %d, expected %d\n",
                file, line, a, !abs, abs);
+        fflush(stdout);
         abort();
     }
+}
+
+static void test_normalize(char *file, int line, char *expected, char *path)
+{
+    void *ctx = talloc_new(NULL);
+    char *normalized = mp_normalize_path(ctx, path);
+    if (strcmp(normalized, expected)) {
+        printf("%s:%d: mp_normalize_path('%s') => %s, expected %s\n",
+               file, line, path, normalized, expected);
+        fflush(stdout);
+        abort();
+    }
+    talloc_free(ctx);
 }
 
 #define TEST_JOIN(a, b, c) \
@@ -29,7 +45,10 @@ static void test_abs(char *file, int line, bool abs, char *a)
 #define TEST_ABS(abs, a) \
     test_abs(__FILE__, __LINE__, abs, a)
 
-static void run(struct test_ctx *ctx)
+#define TEST_NORMALIZE(expected, path) \
+    test_normalize(__FILE__, __LINE__, expected, path)
+
+int main(void)
 {
     TEST_ABS(true, "/ab");
     TEST_ABS(false, "ab");
@@ -60,9 +79,48 @@ static void run(struct test_ctx *ctx)
     TEST_JOIN("c:a",        "b",            "c:a/b");
     TEST_JOIN("c:",         "b",            "c:b");
 #endif
-}
 
-const struct unittest test_paths = {
-    .name = "paths",
-    .run = run,
-};
+    TEST_NORMALIZE("https://foo", "https://foo");
+#if !HAVE_DOS_PATHS
+    TEST_NORMALIZE("/foo", "/foo");
+#endif
+
+#if defined(_WIN32) && (!defined(HAVE_PATHCCH) || !HAVE_PATHCCH)
+    return 0;
+#endif
+
+    void *ctx = talloc_new(NULL);
+    bstr dst = bstr0(mp_getcwd(ctx));
+    bstr_xappend(ctx, &dst, bstr0("/foo"));
+#if HAVE_DOS_PATHS
+    char *p = dst.start;
+    while (*p) {
+        *p = *p == '/' ? '\\' : *p;
+        p++;
+    }
+#endif
+    TEST_NORMALIZE(dst.start, "foo");
+    talloc_free(ctx);
+
+#if HAVE_DOS_PATHS
+    TEST_NORMALIZE("C:\\foo\\baz", "C:/foo/bar/../baz");
+    TEST_NORMALIZE("C:\\", "C:/foo/../..");
+    TEST_NORMALIZE("C:\\foo\\baz", "C:/foo/bar/./../baz");
+    TEST_NORMALIZE("C:\\foo\\bar\\baz", "C:/foo//bar/./baz");
+    TEST_NORMALIZE("C:\\foo\\bar\\baz", "C:/foo\\./bar\\/baz");
+    TEST_NORMALIZE("C:\\file.mkv", "\\\\?\\C:\\folder\\..\\file.mkv");
+    TEST_NORMALIZE("C:\\dir", "\\\\?\\C:\\dir\\subdir\\..\\.");
+    TEST_NORMALIZE("D:\\newfile.txt", "\\\\?\\D:\\\\new\\subdir\\..\\..\\newfile.txt");
+    TEST_NORMALIZE("\\\\server\\share\\path", "\\\\?\\UNC/server/share/path/.");
+    TEST_NORMALIZE("C:\\", "C:/.");
+    TEST_NORMALIZE("C:\\", "C:/../");
+#else
+    TEST_NORMALIZE("/foo/bar", "/foo//bar");
+    TEST_NORMALIZE("/foo/bar", "/foo///bar");
+    TEST_NORMALIZE("/foo/bar", "/foo/bar/");
+    TEST_NORMALIZE("/foo/bar", "/foo/./bar");
+    TEST_NORMALIZE("/usr", "/usr/bin/..");
+#endif
+
+    return 0;
+}

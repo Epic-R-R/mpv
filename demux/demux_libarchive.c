@@ -28,7 +28,7 @@
 #include "stream/stream_libarchive.h"
 
 struct demux_libarchive_opts {
-    int rar_list_all_volumes;
+    bool rar_list_all_volumes;
 };
 
 static int cmp_filename(const void *a, const void *b)
@@ -91,7 +91,7 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
         qsort(files, num_files, sizeof(files[0]), cmp_filename);
 
     for (int n = 0; n < num_files; n++)
-        playlist_add_file(pl, files[n]);
+        playlist_append_file(pl, files[n]);
 
     playlist_set_stream_flags(pl, demuxer->stream_origin);
 
@@ -112,7 +112,7 @@ const struct demuxer_desc demuxer_desc_libarchive = {
     .open = open_file,
     .options = &(const struct m_sub_options){
         .opts = (const struct m_option[]) {
-            {"rar-list-all-volumes", OPT_FLAG(rar_list_all_volumes)},
+            {"rar-list-all-volumes", OPT_BOOL(rar_list_all_volumes)},
             {0}
         },
         .size = sizeof(OPT_BASE_STRUCT),

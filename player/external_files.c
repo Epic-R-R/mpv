@@ -15,9 +15,7 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <dirent.h>
 #include <string.h>
-#include <strings.h>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -26,76 +24,70 @@
 #include "common/common.h"
 #include "common/global.h"
 #include "common/msg.h"
-#include "misc/ctype.h"
 #include "misc/charset_conv.h"
+#include "misc/language.h"
 #include "options/options.h"
 #include "options/path.h"
 #include "external_files.h"
 
-static const char *const sub_exts[] = {"utf", "utf8", "utf-8", "idx", "sub",
-                                       "srt", "rt", "ssa", "ass", "mks", "vtt",
-                                       "sup", "scc", "smi", "lrc", "pgs",
-                                       NULL};
-
-static const char *const audio_exts[] = {"mp3", "aac", "mka", "dts", "flac",
-                                         "ogg", "m4a", "ac3", "opus", "wav",
-                                         "wv",
-                                         NULL};
-
 // Stolen from: vlc/-/blob/master/modules/meta_engine/folder.c#L40
 // sorted by priority (descending)
 static const char *const cover_files[] = {
-    "AlbumArt.jpg",
-    "Album.jpg",
-    "cover.jpg",
-    "cover.png",
-    "front.jpg",
-    "front.png",
-
-    "AlbumArtSmall.jpg",
-    "Folder.jpg",
-    "Folder.png",
-    ".folder.png",
-    "thumb.jpg",
-
-    "front.bmp",
-    "front.gif",
-    "cover.gif",
+    "AlbumArt",
+    "Album",
+    "cover",
+    "front",
+    "AlbumArtSmall",
+    "Folder",
+    ".folder",
+    "thumb",
     NULL
 };
 
-static bool test_ext_list(bstr ext, const char *const *list)
+// Needed for mp_might_be_subtitle_file
+char **sub_exts;
+
+static bool test_ext_list(bstr ext, char **list)
 {
+    if (!list)
+        goto done;
     for (int n = 0; list[n]; n++) {
         if (bstrcasecmp(bstr0(list[n]), ext) == 0)
             return true;
     }
+done:
     return false;
 }
 
-static int test_ext(bstr ext)
+static int test_ext(MPOpts *opts, bstr ext)
 {
-    if (test_ext_list(ext, sub_exts))
+    if (test_ext_list(ext, opts->sub_auto_exts))
         return STREAM_SUB;
-    if (test_ext_list(ext, audio_exts))
+    if (test_ext_list(ext, opts->audiofile_auto_exts))
         return STREAM_AUDIO;
+    if (test_ext_list(ext, opts->coverart_auto_exts))
+        return STREAM_VIDEO;
     return -1;
 }
 
-static int test_cover_filename(bstr fname, int *priority)
+static int test_cover_filename(bstr fname)
 {
     for (int n = 0; cover_files[n]; n++) {
         if (bstrcasecmp(bstr0(cover_files[n]), fname) == 0) {
-            *priority = MP_ARRAY_SIZE(cover_files) - n;
-            return STREAM_VIDEO;
+            return MP_ARRAY_SIZE(cover_files) - n;
         }
     }
-    return -1;
+    return 0;
 }
 
 bool mp_might_be_subtitle_file(const char *filename)
 {
-    return test_ext(bstr_get_ext(bstr0(filename))) == STREAM_SUB;
+    return test_ext_list(bstr_get_ext(bstr0(filename)), sub_exts);
+}
+
+void mp_update_subtitle_exts(struct MPOpts *opts)
+{
+    sub_exts = opts->sub_auto_exts;
 }
 
 static int compare_sub_filename(const void *a, const void *b)
@@ -116,38 +108,6 @@ static int compare_sub_priority(const void *a, const void *b)
     return strcoll(s1->fname, s2->fname);
 }
 
-static struct bstr guess_lang_from_filename(struct bstr name, int *fn_start)
-{
-    if (name.len < 2)
-        return (struct bstr){NULL, 0};
-
-    int n = 0;
-    int i = name.len - 1;
-
-    char thing = '.';
-    if (name.start[i] == ')') {
-        thing = '(';
-        i--;
-    }
-    if (name.start[i] == ']') {
-        thing = '[';
-        i--;
-    }
-
-    while (i >= 0 && mp_isalpha(name.start[i])) {
-        n++;
-        if (n > 3)
-            return (struct bstr){NULL, 0};
-        i--;
-    }
-
-    if (n < 2 || i == 0 || name.start[i] != thing)
-        return (struct bstr){NULL, 0};
-
-    *fn_start = i;
-    return (struct bstr){name.start + i + 1, n};
-}
-
 static void append_dir_subtitles(struct mpv_global *global, struct MPOpts *opts,
                                  struct subfn **slist, int *nsub,
                                  struct bstr path, const char *fname,
@@ -160,7 +120,6 @@ static void append_dir_subtitles(struct mpv_global *global, struct MPOpts *opts,
     struct bstr f_fname = mp_iconv_to_utf8(log, f_fbname,
                                            "UTF-8-MAC", MP_NO_LATIN1_FALLBACK);
     struct bstr f_fname_noext = bstrdup(tmpmem, bstr_strip_ext(f_fname));
-    bstr_lower(f_fname_noext);
     struct bstr f_fname_trim = bstr_strip(f_fname_noext);
 
     if (f_fbname.start != f_fname.start)
@@ -183,7 +142,6 @@ static void append_dir_subtitles(struct mpv_global *global, struct MPOpts *opts,
                                               "UTF-8-MAC", MP_NO_LATIN1_FALLBACK);
         // retrieve various parts of the filename
         struct bstr tmp_fname_noext = bstrdup(tmpmem2, bstr_strip_ext(dename));
-        bstr_lower(tmp_fname_noext);
         struct bstr tmp_fname_ext = bstr_get_ext(dename);
         struct bstr tmp_fname_trim = bstr_strip(tmp_fname_noext);
 
@@ -191,10 +149,7 @@ static void append_dir_subtitles(struct mpv_global *global, struct MPOpts *opts,
             talloc_steal(tmpmem2, dename.start);
 
         // check what it is (most likely)
-        int cover_prio = 0;
-        int type = test_ext(tmp_fname_ext);
-        if (type < 0)
-            type = test_cover_filename(dename, &cover_prio);
+        int type = test_ext(opts, tmp_fname_ext);
         char **langs = NULL;
         int fuzz = -1;
         switch (type) {
@@ -218,42 +173,40 @@ static void append_dir_subtitles(struct mpv_global *global, struct MPOpts *opts,
         // higher prio -> auto-selection may prefer it (0 = not loaded)
         int prio = 0;
 
-        if (bstrcmp(tmp_fname_trim, f_fname_trim) == 0)
+        if (bstrcasecmp(tmp_fname_trim, f_fname_trim) == 0)
             prio |= 32; // exact movie name match
 
         bstr lang = {0};
-        if (bstr_startswith(tmp_fname_trim, f_fname_trim)) {
-            int start = 0;
-            lang = guess_lang_from_filename(tmp_fname_trim, &start);
-
+        int start = 0;
+        lang = mp_guess_lang_from_filename(dename, &start);
+        if (bstr_case_startswith(tmp_fname_trim, f_fname_trim)) {
             if (lang.len && start == f_fname_trim.len)
                 prio |= 16; // exact movie name + followed by lang
-        }
 
-        for (int n = 0; langs && langs[n]; n++) {
-            if (lang.len && bstr_case_startswith(lang, bstr0(langs[n]))) {
-                if (fuzz >= 1)
-                    prio |= 8; // known language -> boost priority
-                break;
+            if (lang.len && fuzz >= 1)
+                prio |= 4; // matches the movie name + a language was matched
+
+            for (int n = 0; langs && langs[n]; n++) {
+                if (lang.len && bstr_case_startswith(lang, bstr0(langs[n]))) {
+                    if (fuzz >= 1)
+                        prio |= 8; // known language -> boost priority
+                    break;
+                }
             }
         }
 
-        if (lang.len && fuzz >= 1)
-            prio |= 4; // matches the movie name + a language was matched
-
         if (bstr_find(tmp_fname_trim, f_fname_trim) >= 0 && fuzz >= 1)
             prio |= 2; // contains the movie name
+
+        if (type == STREAM_VIDEO && opts->coverart_whitelist && prio == 0)
+            prio = test_cover_filename(tmp_fname_trim);
 
         // doesn't contain the movie name
         // don't try in the mplayer subtitle directory
         if (!limit_fuzziness && fuzz >= 2)
             prio |= 1;
 
-        // cover art: just accept it
-        if (type == STREAM_VIDEO && fuzz >= 1)
-            prio = cover_prio;
-
-        mp_dbg(log, "Potential external file: \"%s\"  Priority: %d\n",
+        mp_trace(log, "Potential external file: \"%s\"  Priority: %d\n",
                de->d_name, prio);
 
         if (prio) {

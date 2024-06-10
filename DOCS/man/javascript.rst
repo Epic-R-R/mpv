@@ -27,16 +27,17 @@ otherwise, the documented Lua options, script directories, loading, etc apply to
 JavaScript files too.
 
 Script initialization and lifecycle is the same as with Lua, and most of the Lua
-functions at the modules ``mp``, ``mp.utils``, ``mp.msg`` and ``mp.options`` are
-available to JavaScript with identical APIs - including running commands,
-getting/setting properties, registering events/key-bindings/hooks, etc.
+functions in the modules ``mp``, ``mp.utils``, ``mp.msg``, ``mp.options`` and
+``mp.input`` are available to JavaScript with identical APIs - including running
+commands, getting/setting properties, registering events/key-bindings/hooks,
+etc.
 
 Differences from Lua
 --------------------
 
-No need to load modules. ``mp``, ``mp.utils``,  ``mp.msg`` and ``mp.options``
-are preloaded, and you can use e.g. ``var cwd = mp.utils.getcwd();`` without
-prior setup.
+No need to load modules. ``mp``, ``mp.utils``,  ``mp.msg``, ``mp.options`` and
+``mp.input`` are preloaded, and you can use e.g. ``var cwd =
+mp.utils.getcwd();`` without prior setup.
 
 Errors are slightly different. Where the Lua APIs return ``nil`` for error,
 the JavaScript ones return ``undefined``. Where Lua returns ``something, error``
@@ -58,7 +59,7 @@ Language features - ECMAScript 5
 The scripting backend which mpv currently uses is MuJS - a compatible minimal
 ES5 interpreter. As such, ``String.substring`` is implemented for instance,
 while the common but non-standard ``String.substr`` is not. Please consult the
-MuJS pages on language features and platform support - http://mujs.com .
+MuJS pages on language features and platform support - https://mujs.com .
 
 Unsupported Lua APIs and their JS alternatives
 ----------------------------------------------
@@ -72,12 +73,6 @@ Unsupported Lua APIs and their JS alternatives
 ``utils.format_json(v)``  JS: ``JSON.stringify(v)``
 
 ``utils.to_string(v)``  see ``dump`` below.
-
-``mp.suspend()`` JS: none (deprecated).
-
-``mp.resume()`` JS: none (deprecated).
-
-``mp.resume_all()`` JS: none (deprecated).
 
 ``mp.get_next_timeout()`` see event loop below.
 
@@ -97,9 +92,11 @@ Where the Lua APIs use ``nil`` to indicate error, JS APIs use ``undefined``.
 ``mp.command_native(table [,def])`` (LE)
 
 ``id = mp.command_native_async(table [,fn])`` (LE) Notes: ``id`` is true-thy on
-success, ``fn`` is called always a-sync, ``error`` is empty string on success.
+success, ``error`` is empty string on success.
 
 ``mp.abort_async_command(id)``
+
+``mp.del_property(name)`` (LE)
 
 ``mp.get_property(name [,def])`` (LE)
 
@@ -179,7 +176,8 @@ success, ``fn`` is called always a-sync, ``error`` is empty string on success.
 
 ``mp.utils.readdir(path [, filter])`` (LE)
 
-``mp.utils.file_info(path)`` (LE)
+``mp.utils.file_info(path)`` (LE) Note: like lua - this does NOT expand
+meta-paths like ``~~/foo`` (other JS file functions do expand meta paths).
 
 ``mp.utils.split_path(path)``
 
@@ -197,6 +195,18 @@ success, ``fn`` is called always a-sync, ``error`` is empty string on success.
 
 ``mp.options.read_options(obj [, identifier [, on_update]])`` (types:
 string/boolean/number)
+
+``mp.input.get(obj)``
+
+``mp.input.select(obj)``
+
+``mp.input.terminate()``
+
+``mp.input.log(message, style)``
+
+``mp.input.log_error(message)``
+
+``mp.input.set_log(log)``
 
 Additional utilities
 --------------------
@@ -220,8 +230,9 @@ Additional utilities
     ``undefined`` if the variable is not defined.
 
 ``mp.utils.get_user_path(path)``
-    Expands (mpv) meta paths like ``~/x``, ``~~/y``, ``~~desktop/z`` etc.
-    ``read_file``, ``write_file`` and ``require`` already use this internaly.
+    Trivial wrapper of the ``expand-path`` mpv command, returns a string.
+    ``read_file``, ``write_file``, ``append_file`` and ``require`` already
+    expand the path internally and accept mpv meta-paths like ``~~desktop/foo``.
 
 ``mp.utils.read_file(fname [,max])``
     Returns the content of file ``fname`` as string. If ``max`` is provided and
@@ -232,7 +243,12 @@ Additional utilities
     prefixed with ``file://`` as simple protection against accidental arguments
     switch, e.g. ``mp.utils.write_file("file://~/abc.txt", "hello world")``.
 
-Note: ``read_file`` and ``write_file`` throw on errors, allow text content only.
+``mp.utils.append_file(fname, str)``
+    Same as ``mp.utils.write_file`` if the file ``fname`` does not exist. If it
+    does exist then append instead of overwrite.
+
+Note: ``read_file``, ``write_file`` and ``append_file`` throw on errors, allow
+text content only.
 
 ``mp.get_time_ms()``
     Same as ``mp.get_time()`` but in ms instead of seconds.
@@ -329,10 +345,16 @@ Custom initialization
 ---------------------
 
 After mpv initializes the JavaScript environment for a script but before it
-loads the script - it tries to run the file ``.init.js`` at the root of the mpv
+loads the script - it tries to run the file ``init.js`` at the root of the mpv
 configuration directory. Code at this file can update the environment further
 for all scripts. E.g. if it contains ``mp.module_paths.push("/foo")`` then
-``require`` at all scripts will search global module id's also at ``/foo``.
+``require`` at all scripts will search global module id's also at ``/foo``
+(do NOT do ``mp.module_paths = ["/foo"];`` because this will remove existing
+paths - like ``<script-dir>/modules`` for scripts which load from a directory).
+
+The custom-init file is ignored if mpv is invoked with ``--no-config``.
+
+Before mpv 0.34, the file name was ``.init.js`` (with dot) at the same dir.
 
 The event loop
 --------------

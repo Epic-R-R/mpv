@@ -24,6 +24,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "config.h"
+
+#if HAVE_POSIX || defined(__MINGW32__)
+#include <strings.h>
+#include <unistd.h>
+#endif
+
 #include "osdep/compiler.h"
 #include "mpv_talloc.h"
 
@@ -39,12 +46,16 @@
 #define MPSWAP(type, a, b) \
     do { type SWAP_tmp = b; b = a; a = SWAP_tmp; } while (0)
 #define MP_ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
+#define MP_DIV_UP(x, y) (((x) + (y) - 1) / (y))
 
 // align must be a power of two (align >= 1), x >= 0
 #define MP_ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 #define MP_ALIGN_DOWN(x, align) ((x) & ~((align) - 1))
 #define MP_IS_ALIGNED(x, align) (!((x) & ((align) - 1)))
 #define MP_IS_POWER_OF_2(x) ((x) > 0 && !((x) & ((x) - 1)))
+
+// align to non power of two
+#define MP_ALIGN_NPOT(x, align) ((align) ? MP_DIV_UP(x, align) * (align) : (x))
 
 // Return "a", or if that is NOPTS, return "def".
 #define MP_PTS_OR_DEF(a, def) ((a) == MP_NOPTS_VALUE ? (def) : (a))
@@ -68,12 +79,38 @@ enum stream_type {
     STREAM_TYPE_COUNT,
 };
 
+enum video_sync {
+    VS_DEFAULT = 0,
+    VS_DISP_RESAMPLE,
+    VS_DISP_RESAMPLE_VDROP,
+    VS_DISP_RESAMPLE_NONE,
+    VS_DISP_TEMPO,
+    VS_DISP_ADROP,
+    VS_DISP_VDROP,
+    VS_DISP_NONE,
+    VS_NONE,
+};
+
+#define VS_IS_DISP(x) ((x) == VS_DISP_RESAMPLE ||       \
+                       (x) == VS_DISP_RESAMPLE_VDROP || \
+                       (x) == VS_DISP_RESAMPLE_NONE ||  \
+                       (x) == VS_DISP_TEMPO ||          \
+                       (x) == VS_DISP_ADROP ||          \
+                       (x) == VS_DISP_VDROP ||          \
+                       (x) == VS_DISP_NONE)
+
 extern const char mpv_version[];
 extern const char mpv_builddate[];
 extern const char mpv_copyright[];
 
 char *mp_format_time(double time, bool fractions);
 char *mp_format_time_fmt(const char *fmt, double time);
+
+// Formats a double value to a string with the specified precision.
+// Trailing zeros (and the dot) can be trimmed.
+// Optionally, a plus sign and a percent sign can be added.
+char *mp_format_double(void *talloc_ctx, double val, int precision,
+                       bool plus_sign, bool percent_sign, bool trim);
 
 struct mp_rect {
     int x0, y0;
@@ -86,12 +123,14 @@ struct mp_rect {
 void mp_rect_union(struct mp_rect *rc, const struct mp_rect *src);
 bool mp_rect_intersection(struct mp_rect *rc, const struct mp_rect *rc2);
 bool mp_rect_contains(struct mp_rect *rc, int x, int y);
-bool mp_rect_equals(struct mp_rect *rc1, struct mp_rect *rc2);
+bool mp_rect_equals(const struct mp_rect *rc1, const struct mp_rect *rc2);
 int mp_rect_subtract(const struct mp_rect *rc1, const struct mp_rect *rc2,
                      struct mp_rect res_array[4]);
+void mp_rect_rotate(struct mp_rect *rc, int w, int h, int rotation);
 
 unsigned int mp_log2(uint32_t v);
 uint32_t mp_round_next_power_of_2(uint32_t v);
+int mp_lcm(int x, int y);
 
 int mp_snprintf_cat(char *str, size_t size, const char *format, ...)
     PRINTF_ATTRIBUTE(3, 4);
@@ -131,5 +170,26 @@ char **mp_dup_str_array(void *tctx, char **s);
         if (!(x))               \
             abort();            \
     } while (0)
+
+#ifdef _MSC_VER
+#define strncasecmp _strnicmp
+#define strcasecmp _stricmp
+
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0
+#endif
+
+typedef long long ssize_t;
+typedef unsigned short mode_t;
+#endif
 
 #endif /* MPLAYER_MPCOMMON_H */

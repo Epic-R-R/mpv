@@ -20,8 +20,25 @@
 #ifndef MPLAYER_GETCH2_H
 #define MPLAYER_GETCH2_H
 
+#include <stdarg.h>
 #include <stdbool.h>
-#include <stdio.h>
+
+#include "misc/bstr.h"
+
+#define TERM_ESC_GOTO_YX            "\033[%d;%df"
+#define TERM_ESC_HIDE_CURSOR        "\033[?25l"
+#define TERM_ESC_RESTORE_CURSOR     "\033[?25h"
+#define TERM_ESC_SYNC_UPDATE_BEGIN  "\033[?2026h"
+#define TERM_ESC_SYNC_UPDATE_END    "\033[?2026l"
+
+#define TERM_ESC_CLEAR_SCREEN       "\033[2J"
+#define TERM_ESC_ALT_SCREEN         "\033[?1049h"
+#define TERM_ESC_NORMAL_SCREEN      "\033[?1049l"
+
+#define TERM_ESC_ENABLE_MOUSE       "\033[?1003h"
+#define TERM_ESC_DISABLE_MOUSE      "\033[?1003l"
+
+#define TERM_ESC_GREY               "\033[38;5;8m"
 
 struct input_ctx;
 
@@ -43,8 +60,13 @@ void terminal_get_size(int *w, int *h);
 /* Get terminal-size in columns/rows and width/height in pixels. */
 void terminal_get_size2(int *rows, int *cols, int *px_width, int *px_height);
 
+/* Enable/Disable mouse input. */
+void terminal_set_mouse_input(bool enable);
+
 // Windows only.
-void mp_write_console_ansi(void *wstream, char *buf);
+int mp_console_vfprintf(void *wstream, const char *format, va_list args);
+int mp_console_write(void *wstream, bstr str);
+bool mp_check_console(void *handle);
 
 /* Windows-only function to attach to the parent process's console */
 bool terminal_try_attach(void);

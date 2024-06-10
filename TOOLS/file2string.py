@@ -39,5 +39,6 @@ def file2string(infilename, infile, outfile):
         outfile.write('"' + ''.join(conv[c] for c in line) + '"\n')
 
 if __name__ == "__main__":
+    outfile = open(sys.argv[2], "w")
     with open(sys.argv[1], 'rb') as infile:
-        file2string(sys.argv[1], infile, sys.stdout)
+        file2string(sys.argv[1], infile, outfile)

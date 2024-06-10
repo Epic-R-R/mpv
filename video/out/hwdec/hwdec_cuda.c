@@ -57,12 +57,12 @@ int check_cu(const struct ra_hwdec *hw, CUresult err, const char *func)
 
 #define CHECK_CU(x) check_cu(hw, (x), #x)
 
-const static cuda_interop_init interop_inits[] = {
+static const struct cuda_interop_fn *interop_fns[] = {
 #if HAVE_GL
-    cuda_gl_init,
+    &cuda_gl_fn,
 #endif
 #if HAVE_VULKAN
-    cuda_vk_init,
+    &cuda_vk_fn,
 #endif
     NULL
 };
@@ -73,28 +73,41 @@ static int cuda_init(struct ra_hwdec *hw)
     CUcontext dummy;
     int ret = 0;
     struct cuda_hw_priv *p = hw->priv;
-    CudaFunctions *cu;
-
-    ret = cuda_load_functions(&p->cu, NULL);
-    if (ret != 0) {
-        MP_VERBOSE(hw, "Failed to load CUDA symbols\n");
-        return -1;
-    }
-    cu = p->cu;
-
-    ret = CHECK_CU(cu->cuInit(0));
-    if (ret < 0)
-        return -1;
+    CudaFunctions *cu = NULL;
+    int level = hw->probing ? MSGL_V : MSGL_ERR;
+    bool initialized = false;
 
     // Initialise CUDA context from backend.
-    for (int i = 0; interop_inits[i]; i++) {
-        if (interop_inits[i](hw)) {
-            break;
+    // Note that the interop check doesn't require the CUDA backend to be initialized.
+    // This is important because cuInit wakes up the dgpu (even if the cuda hwdec won't be used!)
+    // Doing this allows us to check if CUDA should be used without waking up the dgpu, avoiding
+    // a few seconds of delay and improving battery life for laptops!
+    for (int i = 0; interop_fns[i]; i++) {
+        if (!interop_fns[i]->check(hw))
+            continue;
+
+        if (!initialized) {
+            ret = cuda_load_functions(&p->cu, NULL);
+            if (ret != 0) {
+                MP_MSG(hw, level, "Failed to load CUDA symbols\n");
+                return -1;
+            }
+
+            cu = p->cu;
+            ret = CHECK_CU(cu->cuInit(0));
+            if (ret < 0)
+                return -1;
+
+            initialized = true;
         }
+
+        if (interop_fns[i]->init(hw))
+            break;
     }
 
     if (!p->ext_init || !p->ext_uninit) {
-        MP_VERBOSE(hw, "CUDA hwdec only works with OpenGL or Vulkan backends.\n");
+        MP_MSG(hw, level,
+               "CUDA hwdec only works with OpenGL or Vulkan backends.\n");
         return -1;
     }
 
@@ -109,7 +122,7 @@ static int cuda_init(struct ra_hwdec *hw)
 
     ret = av_hwdevice_ctx_init(hw_device_ctx);
     if (ret < 0) {
-        MP_ERR(hw, "av_hwdevice_ctx_init failed\n");
+        MP_MSG(hw, level, "av_hwdevice_ctx_init failed\n");
         goto error;
     }
 
@@ -120,6 +133,7 @@ static int cuda_init(struct ra_hwdec *hw)
     p->hwctx = (struct mp_hwdec_ctx) {
         .driver_name = hw->driver->name,
         .av_device_ref = hw_device_ctx,
+        .hw_imgfmt = IMGFMT_CUDA,
     };
     hwdec_devices_add(hw->devs, &p->hwctx);
     return 0;
@@ -253,16 +267,22 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     if (p_owner->do_full_sync)
         CHECK_CU(cu->cuStreamSynchronize(0));
 
+    // fall through
  error:
-   eret = CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-   if (eret < 0)
-       return eret;
 
-   return ret;
+    // Regardless of success or failure, we no longer need the source image,
+    // because this hwdec makes an explicit memcpy into the mapper textures
+    mp_image_unrefp(&mapper->src);
+
+    eret = CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    if (eret < 0)
+        return eret;
+
+    return ret;
 }
 
 const struct ra_hwdec_driver ra_hwdec_cuda = {
-    .name = "cuda-nvdec",
+    .name = "cuda",
     .imgfmts = {IMGFMT_CUDA, 0},
     .priv_size = sizeof(struct cuda_hw_priv),
     .init = cuda_init,

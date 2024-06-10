@@ -43,15 +43,19 @@
 // usually copy the whole struct, so that fields added later will be preserved.
 struct mp_image_params {
     enum mp_imgfmt imgfmt;      // pixel format
+    const char *imgfmt_name;    // pixel format name
     enum mp_imgfmt hw_subfmt;   // underlying format for some hwaccel pixfmts
     int w, h;                   // image dimensions
     int p_w, p_h;               // define pixel aspect ratio (undefined: 0/0)
-    struct mp_colorspace color;
-    enum mp_chroma_location chroma_location;
+    bool force_window;          // fake image created by handle_force_window
+    struct pl_color_space color;
+    struct pl_color_repr repr;
+    enum mp_csp_light light;
+    enum pl_chroma_location chroma_location;
     // The image should be rotated clockwise (0-359 degrees).
     int rotate;
     enum mp_stereo3d_mode stereo3d; // image is encoded with this mode
-    enum mp_alpha_type alpha;   // usually auto; only set if explicitly known
+    struct mp_rect crop;        // crop applied on image
 };
 
 /* Memory management:
@@ -108,6 +112,10 @@ typedef struct mp_image {
     struct AVBufferRef *icc_profile;
     // Closed captions packet, if any (only after decoder)
     struct AVBufferRef *a53_cc;
+    // Dolby Vision metadata, if any
+    struct AVBufferRef *dovi;
+    // Film grain data, if any
+    struct AVBufferRef *film_grain;
     // Other side data we don't care about.
     struct mp_ff_side_data *ff_side_data;
     int num_ff_side_data;
@@ -163,9 +171,12 @@ char *mp_image_params_to_str_buf(char *b, size_t bs,
                                  const struct mp_image_params *p);
 #define mp_image_params_to_str(p) mp_image_params_to_str_buf((char[256]){0}, 256, p)
 
+bool mp_image_crop_valid(const struct mp_image_params *p);
 bool mp_image_params_valid(const struct mp_image_params *p);
 bool mp_image_params_equal(const struct mp_image_params *p1,
                            const struct mp_image_params *p2);
+bool mp_image_params_static_equal(const struct mp_image_params *p1,
+                                  const struct mp_image_params *p2);
 
 void mp_image_params_get_dsize(const struct mp_image_params *p,
                                int *d_w, int *d_h);

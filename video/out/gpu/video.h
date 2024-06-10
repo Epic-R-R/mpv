@@ -40,7 +40,6 @@ struct scaler_config {
     struct scaler_fun window;
     float radius;
     float antiring;
-    float cutoff;
     float clamp;
 };
 
@@ -53,7 +52,6 @@ struct scaler {
     struct ra_tex *lut;
     struct ra_tex *sep_fbo;
     bool insufficient;
-    int lut_size;
 
     // kernel points here
     struct filter_kernel kernel_storage;
@@ -74,11 +72,10 @@ enum dither_algo {
     DITHER_ERROR_DIFFUSION,
 };
 
-enum alpha_mode {
-    ALPHA_NO = 0,
-    ALPHA_YES,
-    ALPHA_BLEND,
-    ALPHA_BLEND_TILES,
+enum background_type {
+    BACKGROUND_NONE = 0,
+    BACKGROUND_COLOR,
+    BACKGROUND_TILES,
 };
 
 enum blend_subs_mode {
@@ -88,66 +85,89 @@ enum blend_subs_mode {
 };
 
 enum tone_mapping {
+    TONE_MAPPING_AUTO,
     TONE_MAPPING_CLIP,
     TONE_MAPPING_MOBIUS,
     TONE_MAPPING_REINHARD,
     TONE_MAPPING_HABLE,
     TONE_MAPPING_GAMMA,
     TONE_MAPPING_LINEAR,
+    TONE_MAPPING_SPLINE,
     TONE_MAPPING_BT_2390,
+    TONE_MAPPING_BT_2446A,
+    TONE_MAPPING_ST2094_40,
+    TONE_MAPPING_ST2094_10,
+};
+
+enum gamut_mode {
+    GAMUT_AUTO,
+    GAMUT_CLIP,
+    GAMUT_PERCEPTUAL,
+    GAMUT_RELATIVE,
+    GAMUT_SATURATION,
+    GAMUT_ABSOLUTE,
+    GAMUT_DESATURATE,
+    GAMUT_DARKEN,
+    GAMUT_WARN,
+    GAMUT_LINEAR,
 };
 
 struct gl_tone_map_opts {
     int curve;
     float curve_param;
     float max_boost;
+    bool inverse;
     int compute_peak;
     float decay_rate;
     float scene_threshold_low;
     float scene_threshold_high;
-    float desat;
-    float desat_exp;
-    int gamut_warning; // bool
-    int gamut_clipping; // bool
+    float peak_percentile;
+    float contrast_recovery;
+    float contrast_smoothness;
+    int gamut_mode;
+    bool visualize;
 };
 
 struct gl_video_opts {
     int dumb_mode;
     struct scaler_config scaler[4];
-    int scaler_lut_size;
     float gamma;
-    int gamma_auto;
+    bool gamma_auto;
     int target_prim;
     int target_trc;
     int target_peak;
+    int target_contrast;
+    int target_gamut;
     struct gl_tone_map_opts tone_map;
-    int correct_downscaling;
-    int linear_downscaling;
-    int linear_upscaling;
-    int sigmoid_upscaling;
+    bool correct_downscaling;
+    bool linear_downscaling;
+    bool linear_upscaling;
+    bool sigmoid_upscaling;
     float sigmoid_center;
     float sigmoid_slope;
-    int scaler_resizes_only;
-    int pbo;
+    bool scaler_resizes_only;
+    bool pbo;
     int dither_depth;
     int dither_algo;
     int dither_size;
-    int temporal_dither;
+    bool temporal_dither;
     int temporal_dither_period;
     char *error_diffusion;
     char *fbo_format;
-    int alpha_mode;
-    int use_rectangle;
-    struct m_color background;
-    int interpolation;
+    int background;
+    bool use_rectangle;
+    struct m_color background_color;
+    bool interpolation;
     float interpolation_threshold;
     int blend_subs;
     char **user_shaders;
-    int deband;
+    char **user_shader_opts;
+    bool deband;
     struct deband_opts *deband_opts;
     float unsharp;
     int tex_pad_x, tex_pad_y;
     struct mp_icc_opts *icc_opts;
+    bool shader_cache;
     int early_flush;
     char *shader_cache_dir;
     char *hwdec_interop;
@@ -163,7 +183,8 @@ enum {
     RENDER_FRAME_SUBS = 1 << 0,
     RENDER_FRAME_OSD = 1 << 1,
     RENDER_FRAME_VF_SUBS = 1 << 2,
-    RENDER_FRAME_DEF = RENDER_FRAME_SUBS | RENDER_FRAME_OSD,
+    RENDER_SCREEN_COLOR = 1 << 3, // 3D LUT and dithering
+    RENDER_FRAME_DEF = RENDER_FRAME_SUBS | RENDER_FRAME_OSD | RENDER_SCREEN_COLOR,
 };
 
 struct gl_video *gl_video_init(struct ra *ra, struct mp_log *log,
@@ -173,7 +194,7 @@ void gl_video_set_osd_source(struct gl_video *p, struct osd_state *osd);
 bool gl_video_check_format(struct gl_video *p, int mp_format);
 void gl_video_config(struct gl_video *p, struct mp_image_params *params);
 void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
-                           struct ra_fbo fbo, int flags);
+                           const struct ra_fbo *fbo, int flags);
 void gl_video_resize(struct gl_video *p,
                      struct mp_rect *src, struct mp_rect *dst,
                      struct mp_osd_res *osd);
@@ -193,21 +214,24 @@ void gl_video_set_ambient_lux(struct gl_video *p, int lux);
 void gl_video_set_icc_profile(struct gl_video *p, bstr icc_data);
 bool gl_video_icc_auto_enabled(struct gl_video *p);
 bool gl_video_gamma_auto_enabled(struct gl_video *p);
-struct mp_colorspace gl_video_get_output_colorspace(struct gl_video *p);
 
 void gl_video_reset(struct gl_video *p);
 bool gl_video_showing_interpolated_frame(struct gl_video *p);
 
 struct mp_hwdec_devices;
-void gl_video_load_hwdecs(struct gl_video *p, struct mp_hwdec_devices *devs,
+void gl_video_init_hwdecs(struct gl_video *p, struct ra_ctx *ra_ctx,
+                          struct mp_hwdec_devices *devs,
                           bool load_all_by_default);
-void gl_video_load_hwdecs_all(struct gl_video *p, struct mp_hwdec_devices *devs);
+struct hwdec_imgfmt_request;
+void gl_video_load_hwdecs_for_img_fmt(struct gl_video *p, struct mp_hwdec_devices *devs,
+                                      struct hwdec_imgfmt_request *params);
 
 struct vo;
 void gl_video_configure_queue(struct gl_video *p, struct vo *vo);
 
 struct mp_image *gl_video_get_image(struct gl_video *p, int imgfmt, int w, int h,
-                                    int stride_align);
+                                    int stride_align, int flags);
 
+struct mp_image_params *gl_video_get_target_params_ptr(struct gl_video *p);
 
 #endif

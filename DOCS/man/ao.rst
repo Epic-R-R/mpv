@@ -12,16 +12,63 @@ in the list.
 
 .. note::
 
-    See ``--ao=help`` for a list of compiled-in audio output drivers. The
-    driver ``--ao=alsa`` is preferred. ``--ao=pulse`` is preferred on systems
-    where PulseAudio is used. On BSD systems, ``--ao=oss`` is preferred.
+    See ``--ao=help`` for a list of compiled-in audio output drivers sorted by
+    autoprobe order.
+
+    Note that the default audio output driver is subject to change, and must
+    not be relied upon. If a certain AO needs to be used, it must be
+    explicitly specified.
 
 Available audio output drivers are:
 
-``alsa`` (Linux only)
-    ALSA audio output driver
+``alsa``
+    ALSA audio output driver.
 
-    See `ALSA audio output options`_ for options specific to this AO.
+    The following global options are supported by this audio output:
+
+    ``--alsa-resample=yes``
+        Enable ALSA resampling plugin. (This is disabled by default, because
+        some drivers report incorrect audio delay in some cases.)
+
+    ``--alsa-mixer-device=<device>``
+        Set the mixer device used with ``ao-volume`` (default: ``default``).
+
+    ``--alsa-mixer-name=<name>``
+        Set the name of the mixer element (default: ``Master``). This is for
+        example ``PCM`` or ``Master``.
+
+    ``--alsa-mixer-index=<number>``
+        Set the index of the mixer channel (default: 0). Consider the output of
+        "``amixer scontrols``", then the index is the number that follows the
+        name of the element.
+
+    ``--alsa-non-interleaved``
+        Allow output of non-interleaved formats (if the audio decoder uses
+        this format). Currently disabled by default, because some popular
+        ALSA plugins are utterly broken with non-interleaved formats.
+
+    ``--alsa-ignore-chmap``
+        Don't read or set the channel map of the ALSA device - only request the
+        required number of channels, and then pass the audio as-is to it. This
+        option most likely should not be used. It can be useful for debugging,
+        or for static setups with a specially engineered ALSA configuration (in
+        this case you should always force the same layout with ``--audio-channels``,
+        or it will work only for files which use the layout implicit to your
+        ALSA device).
+
+    ``--alsa-buffer-time=<microseconds>``
+        Set the requested buffer time in microseconds. A value of 0 skips requesting
+        anything from the ALSA API. This and the ``--alsa-periods`` option uses the
+        ALSA ``near`` functions to set the requested parameters. If doing so results
+        in an empty configuration set, setting these parameters is skipped.
+
+        Both options control the buffer size. A low buffer size can lead to higher
+        CPU usage and audio dropouts, while a high buffer size can lead to higher
+        latency in volume changes and other filtering.
+
+    ``--alsa-periods=<number>``
+        Number of periods requested from the ALSA API. See ``--alsa-buffer-time``
+        for further remarks.
 
     .. warning::
 
@@ -30,7 +77,8 @@ Available audio output drivers are:
         explicitly reject multichannel output, as there is no way to detect
         whether a certain channel layout is actually supported.
 
-        You can also try `using the upmix plugin <http://git.io/vfuAy>`_.
+        You can also try `using the upmix plugin
+        <https://github.com/mpv-player/mpv/wiki/ALSA-Surround-Sound-and-Upmixing>`_.
         This setup enables multichannel audio on the ``default`` device
         with automatic upmixing with shared access, so playing stereo
         and multichannel audio at the same time will work as expected.
@@ -94,13 +142,23 @@ Available audio output drivers are:
         passthrough (even if the device reports it as supported). Use with
         extreme care.
 
-
 ``coreaudio_exclusive`` (macOS only)
     Native macOS audio output driver using direct device access and
     exclusive mode (bypasses the sound server).
 
+``avfoundation`` (macOS only)
+    Native macOS audio output driver using ``AVSampleBufferAudioRenderer``
+    in AVFoundation, which supports `spatial audio
+    <https://support.apple.com/en-us/HT211775>`_.
+
+    .. warning::
+
+        Turning on spatial audio may hang the playback
+        if mpv is not started out of the bundle,
+        though playback with spatial audio off always works.
+
 ``openal``
-    OpenAL audio output driver. This is broken and does not work.
+    OpenAL audio output driver.
 
     ``--openal-num-buffers=<2-128>``
         Specify the number of audio buffers to use. Lower values are better for
@@ -112,9 +170,7 @@ Available audio output drivers are:
 
     ``--openal-direct-channels=<yes|no>``
         Enable OpenAL Soft's direct channel extension when available to avoid
-        tinting the sound with ambisonics or HRTF.
-        Channels are dropped when when they are not available as downmixing
-        will be disabled. Default: no.
+        tinting the sound with ambisonics or HRTF. Default: yes.
 
 ``pulse``
     PulseAudio audio output driver
@@ -129,26 +185,44 @@ Available audio output drivers are:
         Set the audio buffer size in milliseconds. A higher value buffers
         more data, and has a lower probability of buffer underruns. A smaller
         value makes the audio stream react faster, e.g. to playback speed
-        changes.
+        changes. "native" lets the sound server determine buffers.
 
     ``--pulse-latency-hacks=<yes|no>``
-        Enable hacks to workaround PulseAudio timing bugs (default: no). If
+        Enable hacks to workaround PulseAudio timing bugs (default: yes). If
         enabled, mpv will do elaborate latency calculations on its own. If
         disabled, it will use PulseAudio automatically updated timing
         information. Disabling this might help with e.g. networked audio or
         some plugins, while enabling it might help in some unknown situations
-        (it used to be required to get good behavior on old PulseAudio versions).
-
-        If you have stuttering video when using pulse, try to enable this
-        option. (Or try to update PulseAudio.)
+        (it is currently enabled due to known bugs with PulseAudio 16.0).
 
     ``--pulse-allow-suspended=<yes|no>``
         Allow mpv to use PulseAudio even if the sink is suspended (default: no).
         Can be useful if PulseAudio is running as a bridge to jack and mpv has its sink-input set to the one jack is using.
 
+``pipewire``
+    PipeWire audio output driver
+
+    The following global options are supported by this audio output:
+
+    ``--pipewire-buffer=<1-2000|native>``
+        Set the audio buffer size in milliseconds. A higher value buffers
+        more data, and has a lower probability of buffer underruns. A smaller
+        value makes the audio stream react faster, e.g. to playback speed
+        changes. "native" lets the sound server determine buffers.
+
+    ``--pipewire-remote=<remote>``
+        Specify the PipeWire remote daemon name to connect to via local UNIX
+        sockets.
+        An empty <remote> string uses the default remote named ``pipewire-0``.
+
+    ``--pipewire-volume-mode=<channel|global>``
+        Specify if the ``ao-volume`` property should apply to the channel
+        volumes or the global volume.
+        By default the channel volumes are used.
+
 ``sdl``
-    SDL 1.2+ audio output driver. Should work on any platform supported by SDL
-    1.2, but may require the ``SDL_AUDIODRIVER`` environment variable to be set
+    SDL 2.0+ audio output driver. Should work on any platform supported by SDL
+    2.0, but may require the ``SDL_AUDIODRIVER`` environment variable to be set
     appropriately for your system.
 
     .. note:: This driver is for compatibility with extremely foreign
@@ -219,5 +293,26 @@ Available audio output drivers are:
         ``no-waveheader`` option - with ``waveheader`` it's broken, because
         it will write a WAVE header every time the file is opened.
 
+``sndio``
+    Audio output to the OpenBSD sndio sound system
+
+    (Note: only supports mono, stereo, 4.0, 5.1 and 7.1 channel
+    layouts.)
+
 ``wasapi``
     Audio output to the Windows Audio Session API.
+
+    The following global options are supported by this audio output:
+
+    ``--wasapi-exclusive-buffer=<default|min|1-2000000>``
+        Set buffer duration in exclusive mode (i.e., with
+        ``--audio-exclusive=yes``). ``default`` and ``min`` use the default and
+        minimum device period reported by WASAPI, respectively. You can also
+        directly specify the buffer duration in microseconds, in which case a
+        duration shorter than the minimum device period will be rounded up to
+        the minimum period.
+
+        The default buffer duration should provide robust playback in most
+        cases, but reportedly on some devices there are glitches following
+        stream resets under the default setting. In such cases, specifying a
+        shorter duration might help.

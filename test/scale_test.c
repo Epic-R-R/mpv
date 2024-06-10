@@ -10,7 +10,7 @@ static struct mp_image *gen_repack_test_img(int w, int h, int bytes, bool rgb,
     struct mp_regular_imgfmt planar_desc = {
         .component_type = MP_COMPONENT_TYPE_UINT,
         .component_size = bytes,
-        .forced_csp = rgb ? MP_CSP_RGB : 0,
+        .forced_csp = rgb ? PL_COLOR_SYSTEM_RGB : 0,
         .num_planes = alpha ? 4 : 3,
         .planes = {
             {1, {rgb ? 2 : 1}},
@@ -55,13 +55,14 @@ static struct mp_image *gen_repack_test_img(int w, int h, int bytes, bool rgb,
 static void dump_image(struct scale_test *stest, const char *name,
                        struct mp_image *img)
 {
-    char *path = mp_tprintf(4096, "%s/%s.png", stest->ctx->out_path, name);
+    char *path = mp_tprintf(4096, "%s/%s.png", stest->outdir, name);
 
     struct image_writer_opts opts = image_writer_opts_defaults;
     opts.format = AV_CODEC_ID_PNG;
 
-    if (!write_image(img, &opts, path, stest->ctx->global, stest->ctx->log)) {
-        MP_FATAL(stest->ctx, "Failed to write '%s'.\n", path);
+    if (!write_image(img, &opts, path, NULL, NULL, true)) {
+        printf("Failed to write '%s'.\n", path);
+        fflush(stdout);
         abort();
     }
 }
@@ -101,8 +102,8 @@ static void assert_imgs_equal(struct scale_test *stest, FILE *f,
 
 void repack_test_run(struct scale_test *stest)
 {
-    char *logname = mp_tprintf(80, "%s.log", stest->test_name);
-    FILE *f = test_open_out(stest->ctx, logname);
+    char *logname = mp_tprintf(80, "../%s.log", stest->test_name);
+    FILE *f = test_open_out(stest->outdir, logname);
 
     if (!stest->sws) {
         init_imgfmts_list();
@@ -129,7 +130,7 @@ void repack_test_run(struct scale_test *stest)
             if (!mp_get_regular_imgfmt(&rdesc, ofmt))
                 continue;
         }
-        if (rdesc.num_planes > 1 || rdesc.forced_csp != MP_CSP_RGB)
+        if (rdesc.num_planes > 1 || rdesc.forced_csp != PL_COLOR_SYSTEM_RGB)
             continue;
 
         struct mp_image *test_img = NULL;
@@ -187,6 +188,6 @@ void repack_test_run(struct scale_test *stest)
 
     fclose(f);
 
-    assert_text_files_equal(stest->ctx, logname, logname,
+    assert_text_files_equal(stest->refdir, stest->outdir, logname,
                             "This can fail if FFmpeg adds or removes pixfmts.");
 }

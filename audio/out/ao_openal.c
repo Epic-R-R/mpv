@@ -19,8 +19,6 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -58,7 +56,7 @@ struct priv {
     ALenum al_format;
     int num_buffers;
     int num_samples;
-    int direct_channels;
+    bool direct_channels;
 };
 
 static int control(struct ao *ao, enum aocontrol cmd, void *arg)
@@ -67,13 +65,13 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
     case AOCONTROL_GET_VOLUME:
     case AOCONTROL_SET_VOLUME: {
         ALfloat volume;
-        ao_control_vol_t *vol = (ao_control_vol_t *)arg;
+        float *vol = arg;
         if (cmd == AOCONTROL_SET_VOLUME) {
-            volume = (vol->left + vol->right) / 200.0;
+            volume = *vol / 100.0;
             alListenerf(AL_GAIN, volume);
         }
         alGetListenerf(AL_GAIN, &volume);
-        vol->left = vol->right = volume * 100;
+        *vol = volume * 100;
         return CONTROL_TRUE;
     }
     case AOCONTROL_GET_MUTE:
@@ -199,8 +197,14 @@ static int init(struct ao *ao)
     alListenerfv(AL_ORIENTATION, direction);
 
     alGenSources(1, &source);
-    if (p->direct_channels && alGetEnumValue((ALchar*)"AL_DIRECT_CHANNELS_SOFT")) {
-        alSourcei(source, alGetEnumValue((ALchar*)"AL_DIRECT_CHANNELS_SOFT"), AL_TRUE);
+    if (p->direct_channels) {
+        if (alIsExtensionPresent("AL_SOFT_direct_channels_remix")) {
+            alSourcei(source,
+                alGetEnumValue((ALchar*)"AL_DIRECT_CHANNELS_SOFT"),
+                alcGetEnumValue(dev, "AL_REMIX_UNMATCHED_SOFT"));
+        } else {
+            MP_WARN(ao, "Direct channels aren't supported by this version of OpenAL\n");
+        }
     }
 
     cur_buf = 0;
@@ -385,12 +389,12 @@ const struct ao_driver audio_out_openal = {
     .priv_defaults = &(const struct priv) {
         .num_buffers = 4,
         .num_samples = 8192,
-        .direct_channels = 0,
+        .direct_channels = true,
     },
     .options = (const struct m_option[]) {
         {"num-buffers", OPT_INT(num_buffers), M_RANGE(2, MAX_BUF)},
         {"num-samples", OPT_INT(num_samples), M_RANGE(256, MAX_SAMPLES)},
-        {"direct-channels", OPT_FLAG(direct_channels)},
+        {"direct-channels", OPT_BOOL(direct_channels)},
         {0}
     },
     .options_prefix = "openal",

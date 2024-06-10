@@ -15,10 +15,6 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
-
-#include "config.h"
-
 #include "common/common.h"
 #include "common/msg.h"
 #include "common/msg_control.h"

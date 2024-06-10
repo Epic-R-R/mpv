@@ -22,7 +22,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
@@ -44,7 +43,6 @@
 #include "video/mp_image.h"
 
 #include "win_state.h"
-#include "config.h"
 #include "vo.h"
 
 struct formatmap_entry {
@@ -62,7 +60,7 @@ const struct formatmap_entry formats[] = {
     {SDL_PIXELFORMAT_RGBX8888, IMGFMT_RGB0, 0}, // has no alpha -> bad for OSD
     {SDL_PIXELFORMAT_BGR888, IMGFMT_0BGR, 0}, // BGR888 means XBGR8888
     {SDL_PIXELFORMAT_BGRX8888, IMGFMT_BGR0, 0}, // has no alpha -> bad for OSD
-    {SDL_PIXELFORMAT_ARGB8888, IMGFMT_ARGB, 1}, // matches SUBBITMAP_RGBA
+    {SDL_PIXELFORMAT_ARGB8888, IMGFMT_ARGB, 1}, // matches SUBBITMAP_BGRA
     {SDL_PIXELFORMAT_RGBA8888, IMGFMT_RGBA, 1},
     {SDL_PIXELFORMAT_ABGR8888, IMGFMT_ABGR, 1},
     {SDL_PIXELFORMAT_BGRA8888, IMGFMT_BGRA, 1},
@@ -71,7 +69,7 @@ const struct formatmap_entry formats[] = {
     {SDL_PIXELFORMAT_RGBX8888, IMGFMT_0BGR, 0}, // has no alpha -> bad for OSD
     {SDL_PIXELFORMAT_BGR888, IMGFMT_RGB0, 0}, // BGR888 means XBGR8888
     {SDL_PIXELFORMAT_BGRX8888, IMGFMT_0RGB, 0}, // has no alpha -> bad for OSD
-    {SDL_PIXELFORMAT_ARGB8888, IMGFMT_BGRA, 1}, // matches SUBBITMAP_RGBA
+    {SDL_PIXELFORMAT_ARGB8888, IMGFMT_BGRA, 1}, // matches SUBBITMAP_BGRA
     {SDL_PIXELFORMAT_RGBA8888, IMGFMT_ABGR, 1},
     {SDL_PIXELFORMAT_ABGR8888, IMGFMT_RGBA, 1},
     {SDL_PIXELFORMAT_BGRA8888, IMGFMT_ARGB, 1},
@@ -193,9 +191,9 @@ struct priv {
     struct m_config_cache *opts_cache;
 
     // options
-    int allow_sw;
-    int switch_mode;
-    int vsync;
+    bool allow_sw;
+    bool switch_mode;
+    bool vsync;
 };
 
 static bool lock_texture(struct vo *vo, struct mp_image *texmpi)
@@ -241,7 +239,7 @@ static bool lock_texture(struct vo *vo, struct mp_image *texmpi)
 }
 
 static bool is_good_renderer(SDL_RendererInfo *ri,
-                             const char *driver_name_wanted, int allow_sw,
+                             const char *driver_name_wanted, bool allow_sw,
                              struct formatmap_entry *osd_format)
 {
     if (driver_name_wanted && driver_name_wanted[0])
@@ -521,10 +519,13 @@ static void wakeup(struct vo *vo)
     SDL_PushEvent(&event);
 }
 
-static void wait_events(struct vo *vo, int64_t until_time_us)
+static void wait_events(struct vo *vo, int64_t until_time_ns)
 {
-    int64_t wait_us = until_time_us - mp_time_us();
-    int timeout_ms = MPCLAMP((wait_us + 500) / 1000, 0, 10000);
+    int64_t wait_ns = until_time_ns - mp_time_ns();
+    // Round-up to 1ms for short timeouts (100us, 1000us]
+    if (wait_ns > MP_TIME_US_TO_NS(100))
+        wait_ns = MPMAX(wait_ns, MP_TIME_MS_TO_NS(1));
+    int timeout_ms = MPCLAMP(wait_ns / MP_TIME_MS_TO_NS(1), 0, 10000);
     SDL_Event ev;
 
     while (SDL_WaitEventTimeout(&ev, timeout_ms)) {
@@ -544,6 +545,10 @@ static void wait_events(struct vo *vo, int64_t until_time_us)
                 break;
             case SDL_WINDOWEVENT_LEAVE:
                 mp_input_put_key(vo->input_ctx, MP_KEY_MOUSE_LEAVE);
+                break;
+            case SDL_WINDOWEVENT_FOCUS_LOST:
+            case SDL_WINDOWEVENT_FOCUS_GAINED:
+                vo_event(vo, VO_EVENT_FOCUS);
                 break;
             }
             break;
@@ -621,9 +626,9 @@ static void wait_events(struct vo *vo, int64_t until_time_us)
         }
         case SDL_MOUSEWHEEL: {
 #if SDL_VERSION_ATLEAST(2, 0, 4)
-            double multiplier = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -0.1 : 0.1;
+            double multiplier = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1 : 1;
 #else
-            double multiplier = 0.1;
+            double multiplier = 1;
 #endif
             int y_code = ev.wheel.y > 0 ? MP_WHEEL_UP : MP_WHEEL_DOWN;
             mp_input_put_wheel(vo->input_ctx, y_code, abs(ev.wheel.y) * multiplier);
@@ -800,7 +805,7 @@ static void draw_osd(struct vo *vo)
     struct priv *vc = vo->priv;
 
     static const bool osdformats[SUBBITMAP_COUNT] = {
-        [SUBBITMAP_RGBA] = true,
+        [SUBBITMAP_BGRA] = true,
     };
 
     osd_draw(vo->osd, vc->osd_res, vc->osd_pts, 0, osdformats, draw_osd_cb, vo);
@@ -870,7 +875,7 @@ static int query_format(struct vo *vo, int format)
     return 0;
 }
 
-static void draw_image(struct vo *vo, mp_image_t *mpi)
+static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *vc = vo->priv;
 
@@ -880,20 +885,16 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
 
     SDL_SetTextureBlendMode(vc->tex, SDL_BLENDMODE_NONE);
 
-    if (mpi) {
-        vc->osd_pts = mpi->pts;
+    if (frame->current) {
+        vc->osd_pts = frame->current->pts;
 
         mp_image_t texmpi;
-        if (!lock_texture(vo, &texmpi)) {
-            talloc_free(mpi);
+        if (!lock_texture(vo, &texmpi))
             return;
-        }
 
-        mp_image_copy(&texmpi, mpi);
+        mp_image_copy(&texmpi, frame->current);
 
         SDL_UnlockTexture(vc->tex);
-
-        talloc_free(mpi);
     }
 
     SDL_Rect src, dst;
@@ -941,9 +942,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
         }
         return 1;
     }
-    case VOCTRL_REDRAW_FRAME:
-        draw_image(vo, NULL);
-        return 1;
     case VOCTRL_SET_PANSCAN:
         force_resize(vo);
         return VO_TRUE;
@@ -964,6 +962,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_UPDATE_WINDOW_TITLE:
         SDL_SetWindowTitle(vc->window, (char *)data);
         return true;
+    case VOCTRL_GET_FOCUSED:
+        *(bool *)data = SDL_GetWindowFlags(vc->window) & SDL_WINDOW_INPUT_FOCUS;
+        return VO_TRUE;
     }
     return VO_NOTIMPL;
 }
@@ -976,20 +977,19 @@ const struct vo_driver video_out_sdl = {
     .priv_size = sizeof(struct priv),
     .priv_defaults = &(const struct priv) {
         .renderer_index = -1,
-        .vsync = 1,
-        .screensaver_enabled = false,
+        .vsync = true,
     },
     .options = (const struct m_option []){
-        {"sw", OPT_FLAG(allow_sw)},
-        {"switch-mode", OPT_FLAG(switch_mode)},
-        {"vsync", OPT_FLAG(vsync)},
+        {"sw", OPT_BOOL(allow_sw)},
+        {"switch-mode", OPT_BOOL(switch_mode)},
+        {"vsync", OPT_BOOL(vsync)},
         {NULL}
     },
     .preinit = preinit,
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    .draw_image = draw_image,
+    .draw_frame = draw_frame,
     .uninit = uninit,
     .flip_page = flip_page,
     .wait_events = wait_events,

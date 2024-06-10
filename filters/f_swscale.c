@@ -68,7 +68,7 @@ bool mp_sws_supports_input(int imgfmt)
     return sws_isSupportedInput(imgfmt2pixfmt(imgfmt));
 }
 
-static void process(struct mp_filter *f)
+static void sws_process(struct mp_filter *f)
 {
     struct mp_sws_filter *s = f->priv;
 
@@ -106,12 +106,6 @@ static void process(struct mp_filter *f)
 
     mp_image_copy_attributes(dst, src);
 
-    // If we convert from RGB to YUV, guess a default.
-    if (mp_imgfmt_get_forced_csp(src->imgfmt) == MP_CSP_RGB &&
-        mp_imgfmt_get_forced_csp(dst->imgfmt) == MP_CSP_AUTO)
-    {
-        dst->params.color.levels = MP_CSP_LEVELS_AUTO;
-    }
     if (s->use_out_params)
         dst->params = s->out_params;
     mp_image_params_guess_csp(&dst->params);
@@ -136,7 +130,7 @@ error:
 static const struct mp_filter_info sws_filter = {
     .name = "swscale",
     .priv_size = sizeof(struct mp_sws_filter),
-    .process = process,
+    .process = sws_process,
 };
 
 struct mp_sws_filter *mp_sws_filter_create(struct mp_filter *parent)

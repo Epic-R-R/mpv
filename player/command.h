@@ -21,6 +21,7 @@
 #include <stdbool.h>
 
 #include "libmpv/client.h"
+#include "osdep/compiler.h"
 
 struct MPContext;
 struct mp_cmd;
@@ -69,6 +70,7 @@ void run_command(struct MPContext *mpctx, struct mp_cmd *cmd,
                  struct mp_abort_entry *abort,
                  void (*on_completion)(struct mp_cmd_ctx *cmd),
                  void *on_completion_priv);
+void run_command_opts(struct MPContext *mpctx);
 void mp_cmd_ctx_complete(struct mp_cmd_ctx *cmd);
 PRINTF_ATTRIBUTE(3, 4)
 void mp_cmd_msg(struct mp_cmd_ctx *cmd, int status, const char *msg, ...);
@@ -103,6 +105,10 @@ enum {
     MP_EVENT_CORE_IDLE,
     MP_EVENT_DURATION_UPDATE,
     MP_EVENT_INPUT_PROCESSED,
+    MP_EVENT_TRACKS_CHANGED,
+    MP_EVENT_TRACK_SWITCHED,
+    MP_EVENT_METADATA_UPDATE,
+    MP_EVENT_CHAPTER_CHANGE,
 };
 
 bool mp_hook_test_completion(struct MPContext *mpctx, char *type);

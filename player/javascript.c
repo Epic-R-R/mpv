@@ -17,11 +17,8 @@
 
 #include <assert.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <dirent.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -51,7 +48,7 @@
 // All these are generated from player/javascript/*.js
 static const char *const builtin_files[][3] = {
     {"@/defaults.js",
-#   include "generated/player/javascript/defaults.js.inc"
+#   include "player/javascript/defaults.js.inc"
     },
     {0}
 };
@@ -101,16 +98,25 @@ static uint64_t jsL_checkuint64(js_State *J, int idx);
 //   padded with undefined if called with less, or bigger if called with more.
 //
 // - Almost all vm APIs (js_*) may throw an error - a longjmp to the last
-//   recovery/catch point, which could skip releasing resources. Use protected
-//   code (e.g. js_pcall) between aquisition and release. Alternatively, use
-//   the autofree mechanism to manage it more easily. See more details below.
+//   recovery/catch point, which could skip releasing resources. This includes
+//   js_try itself(!), except at the outer-most [1] js_try which is always
+//   entering the try part (and the catch part if the try part throws).
+//   The assumption should be that anything can throw and needs careful setup.
+//   One such automated setup is the autofree mechanism. Details later.
 //
 // - Unless named s_foo, all the functions at this file (inc. init) which
 //   touch the vm may throw, but either cleanup resources regardless (mostly
 //   autofree) or leave allocated resources on caller-provided talloc context
 //   which the caller should release, typically with autofree (e.g. makenode).
 //
-// - Functions named s_foo (safe foo) never throw, return 0 on success, else 1.
+// - Functions named s_foo (safe foo) never throw if called at the outer-most
+//   try-levels, or, inside JS C functions - never throw after allocating.
+//   If they didn't throw then they return 0 on success, 1 on js-errors.
+//
+// [1] In practice the N outer-most (nested) tries are guaranteed to enter the
+//     try/carch code, where N is the mujs try-stack size (64 with mujs 1.1.3).
+//     But because we can't track try-level at (called-back) JS C functions,
+//     it's only guaranteed when we know we're near the outer-most try level.
 
 /**********************************************************************
  *  mpv scripting API error handling
@@ -201,13 +207,27 @@ static bool pushed_error(js_State *J, int err, int def)
 //   inserted into the vm using af_newcfunction, but otherwise used normally.
 //
 //  To wrap an autofree function af_TARGET in C:
-//  1. Create a wrapper s_TARGET which runs af_TARGET safely inside js_try.
-//  2. Use s_TARGET like so (always autofree, and throws if af_TARGET threw):
-//       void *af = talloc_new(NULL);
-//       int r = s_TARGET(J, ..., af);  // use J, af where the callee expects.
+//  1. Create a wrapper s_TARGET which does this:
+//      if (js_try(J))
+//          return 1;
+//      *af = talloc_new(NULL);
+//      af_TARGET(J, ..., *af);
+//      js_endtry(J);
+//      return 0;
+//  2. Use s_TARGET like so (frees if allocated, throws if {s,af}_TARGET threw):
+//       void *af = NULL;
+//       int r = s_TARGET(J, ..., &af);  // use J, af where the callee expects.
 //       talloc_free(af);
 //       if (r)
 //           js_throw(J);
+//
+//  The reason that the allocation happens inside try/catch is that js_try
+//  itself can throw (if it runs out of try-stack) and therefore the code
+//  inside the try part is not reached - but neither is the catch part(!),
+//  and instead it throws to the next outer catch - but before we've allocated
+//  anything, hence no leaks on such case. If js_try did get entered, then the
+//  allocation happened, and then if af_TARGET threw then s_TARGET will catch
+//  it (and return 1) and we'll free if afterwards.
 
 // add_af_file, add_af_dir, add_af_mpv_alloc take a valid FILE*/DIR*/char* value
 // respectively, and fclose/closedir/mpv_free it when the parent is freed.
@@ -266,11 +286,12 @@ static mpv_node *new_af_mpv_node(void *parent)
 typedef void (*af_CFunction)(js_State*, void*);
 
 // safely run autofree js c function directly
-static int s_run_af_jsc(js_State *J, af_CFunction fn, void *af)
+static int s_run_af_jsc(js_State *J, af_CFunction fn, void **af)
 {
     if (js_try(J))
         return 1;
-    fn(J, af);
+    *af = talloc_new(NULL);
+    fn(J, *af);
     js_endtry(J);
     return 0;
 }
@@ -285,8 +306,8 @@ static void script__autofree(js_State *J)
     af_CFunction fn = (af_CFunction)js_touserdata(J, -1, "af_fn");
     js_pop(J, 2);
 
-    void *af = talloc_new(NULL);
-    int r = s_run_af_jsc(J, fn, af);
+    void *af = NULL;
+    int r = s_run_af_jsc(J, fn, &af);
     talloc_free(af);
     if (r)
         js_throw(J);
@@ -357,11 +378,12 @@ static void af_push_file(js_State *J, const char *fname, int limit, void *af)
 }
 
 // Safely run af_push_file.
-static int s_push_file(js_State *J, const char *fname, int limit, void *af)
+static int s_push_file(js_State *J, const char *fname, int limit, void **af)
 {
     if (js_try(J))
         return 1;
-    af_push_file(J, fname, limit, af);
+    *af = talloc_new(NULL);
+    af_push_file(J, fname, limit, *af);
     js_endtry(J);
     return 0;
 }
@@ -369,8 +391,8 @@ static int s_push_file(js_State *J, const char *fname, int limit, void *af)
 // Called directly, push up to limit bytes of file fname (from builtin/os).
 static void push_file_content(js_State *J, const char *fname, int limit)
 {
-    void *af = talloc_new(NULL);
-    int r = s_push_file(J, fname, limit, af);
+    void *af = NULL;
+    int r = s_push_file(J, fname, limit, &af);
     talloc_free(af);
     if (r)
         js_throw(J);
@@ -510,8 +532,7 @@ static int s_load_javascript(struct mp_script_args *args)
     js_Alloc alloc_fn = NULL;
     void *actx = NULL;
 
-    char *mem_report = getenv("MPV_LEAK_REPORT");
-    if (mem_report && strcmp(mem_report, "1") == 0) {
+    if (args->mpctx->opts->js_memory_report) {
         alloc_fn = mp_js_alloc;
         actx = ctx;
     }
@@ -585,9 +606,10 @@ static void script__request_event(js_State *J)
     const char *event = js_tostring(J, 1);
     bool enable = js_toboolean(J, 2);
 
-    const char *name;
-    for (int n = 0; n < 256 && (name = mpv_event_name(n)); n++) {
-        if (strcmp(name, event) == 0) {
+    for (int n = 0; n < 256; n++) {
+        // some n's may be missing ("holes"), returning NULL
+        const char *name = mpv_event_name(n);
+        if (name && strcmp(name, event) == 0) {
             push_status(J, mpv_request_event(jclient(J), n, enable));
             return;
         }
@@ -670,6 +692,13 @@ static void script_get_property(js_State *J, void *af)
         add_af_mpv_alloc(af, res);
     if (!pushed_error(J, e, 2))
         js_pushstring(J, res);
+}
+
+// args: name
+static void script_del_property(js_State *J)
+{
+    int e = mpv_del_property(jclient(J), js_tostring(J, 1));
+    push_status(J, e);
 }
 
 // args: name [,def]
@@ -918,33 +947,31 @@ static void script_join_path(js_State *J, void *af)
     js_pushstring(J, mp_path_join(af, js_tostring(J, 1), js_tostring(J, 2)));
 }
 
-static void script_get_user_path(js_State *J, void *af)
-{
-    const char *path = js_tostring(J, 1);
-    js_pushstring(J, mp_get_user_path(af, jctx(J)->mpctx->global, path));
-}
-
-// args: prefixed file name, data (c-str)
-static void script_write_file(js_State *J, void *af)
+// args: is_append, prefixed file name, data (c-str)
+static void script__write_file(js_State *J, void *af)
 {
     static const char *prefix = "file://";
-    const char *fname = js_tostring(J, 1);
-    const char *data = js_tostring(J, 2);
+    bool append = js_toboolean(J, 1);
+    const char *fname = js_tostring(J, 2);
+    const char *data = js_tostring(J, 3);
+    const char *opstr = append ? "append" : "write";
+
     if (strstr(fname, prefix) != fname)  // simple protection for incorrect use
         js_error(J, "File name must be prefixed with '%s'", prefix);
     fname += strlen(prefix);
     fname = mp_get_user_path(af, jctx(J)->mpctx->global, fname);
-    MP_VERBOSE(jctx(J), "Writing file '%s'\n", fname);
+    MP_VERBOSE(jctx(J), "%s file '%s'\n", opstr, fname);
 
-    FILE *f = fopen(fname, "wb");
+    FILE *f = fopen(fname, append ? "ab" : "wb");
     if (!f)
-        js_error(J, "Cannot open file for writing: '%s'", fname);
+        js_error(J, "Cannot open (%s) file: '%s'", opstr, fname);
     add_af_file(af, f);
 
     int len = strlen(data);  // limited by terminating null
     int wrote = fwrite(data, 1, len, f);
     if (len != wrote)
-        js_error(J, "Cannot write to file: '%s'", fname);
+        js_error(J, "Cannot %s to file: '%s'", opstr, fname);
+    js_pushboolean(J, 1);  // success. doesn't touch last_error
 }
 
 // args: env var name
@@ -1040,7 +1067,7 @@ static int get_obj_properties(void *ta_ctx, char ***keys, js_State *J, int idx)
 static bool same_as_int64(double d)
 {
     // The range checks also validly filter inf and nan, so behavior is defined
-    return d >= INT64_MIN && d <= INT64_MAX && d == (int64_t)d;
+    return d >= INT64_MIN && d <= (double) INT64_MAX && d == (int64_t)d;
 }
 
 static int jsL_checkint(js_State *J, int idx)
@@ -1054,7 +1081,7 @@ static int jsL_checkint(js_State *J, int idx)
 static uint64_t jsL_checkuint64(js_State *J, int idx)
 {
     double d = js_tonumber(J, idx);
-    if (!(d >= 0 && d <= UINT64_MAX))
+    if (!(d >= 0 && d <= (double) UINT64_MAX))
         js_error(J, "uint64 out of range at index %d", idx);
     return d;
 }
@@ -1147,6 +1174,7 @@ static const struct fn_entry main_fns[] = {
     AF_ENTRY(command_native, 2),
     AF_ENTRY(_command_native_async, 2),
     FN_ENTRY(_abort_async_command, 1),
+    FN_ENTRY(del_property, 1),
     FN_ENTRY(get_property_bool, 2),
     FN_ENTRY(get_property_number, 2),
     AF_ENTRY(get_property_native, 2),
@@ -1175,11 +1203,10 @@ static const struct fn_entry utils_fns[] = {
     FN_ENTRY(file_info, 1),
     FN_ENTRY(split_path, 1),
     AF_ENTRY(join_path, 2),
-    AF_ENTRY(get_user_path, 1),
     FN_ENTRY(get_env_list, 0),
 
     FN_ENTRY(read_file, 2),
-    AF_ENTRY(write_file, 2),
+    AF_ENTRY(_write_file, 3),
     FN_ENTRY(getenv, 1),
     FN_ENTRY(compile_js, 2),
     FN_ENTRY(_gc, 1),
@@ -1226,7 +1253,7 @@ static void add_functions(js_State *J, struct script_ctx *ctx)
 
 // main export of this file, used by cplayer to load js scripts
 const struct mp_scripting mp_scripting_js = {
-    .name = "javascript",
+    .name = "js",
     .file_ext = "js",
     .load = s_load_javascript,
 };
